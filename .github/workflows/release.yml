@@ -4,23 +4,48 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-linux-amd64:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Rust
-        uses: actions/setup-rust@v1
-        with:
-          rust-version: stable
+        # More current than actions-rs/toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build binary
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build binary (release)
         run: cargo build --release
 
-      - name: Upload Release Asset
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/haystack dist/haystack-linux-amd64
+          chmod +x dist/haystack-linux-amd64
+          tar -C dist -czf haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz haystack-linux-amd64
+          sha256sum haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz > haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz.sha256
+
+      - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/haystack
+          files: |
+            haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz
+            haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
