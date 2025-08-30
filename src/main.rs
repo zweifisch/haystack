@@ -111,7 +111,21 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig) -> Result<()> 
                         out_path.display()
                     );
                 }
-                _ => {}
+                _ => {
+                    // Copy static files as-is
+                    let rel = path.strip_prefix(src_dir).unwrap();
+                    let mut out_path = out_dir.to_path_buf();
+                    out_path.push(rel);
+                    if let Some(parent) = out_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(path, &out_path).with_context(|| format!(
+                        "copying static {} -> {}",
+                        path.display(),
+                        out_path.display()
+                    ))?;
+                    println!("Copied {} -> {}", path.display(), out_path.display());
+                }
             }
         }
     }
@@ -133,35 +147,54 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig) -> Result<()> {
             path = "index.html";
         }
 
-        // Only handle .html requests
-        if !path.ends_with(".html") {
-            let resp = Response::from_string("Not Found").with_status_code(404);
+        // Basic path traversal guard
+        if path.split('/').any(|seg| seg == ".." || seg.contains('\\')) {
+            let resp = Response::from_string("Bad Request").with_status_code(400);
             let _ = request.respond(resp);
             continue;
         }
 
-        let base = &path[..path.len() - ".html".len()];
-        let md_path = src_dir.join(format!("{}.md", base));
-        let org_path = src_dir.join(format!("{}.org", base));
+        let resp = if path.ends_with(".html") {
+            let base = &path[..path.len() - ".html".len()];
+            let md_path = src_dir.join(format!("{}.md", base));
+            let org_path = src_dir.join(format!("{}.org", base));
 
-        let resp = if md_path.exists() {
-            match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html(&s, theme)) {
-                Ok(html) => Response::from_string(html)
-                    .with_status_code(200)
-                    .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
-                Err(e) => Response::from_string(format!("Error reading {}: {}", md_path.display(), e))
-                    .with_status_code(500),
-            }
-        } else if org_path.exists() {
-            match fs::read_to_string(&org_path).map(|s| convert_org_to_html(&s, theme)) {
-                Ok(html) => Response::from_string(html)
-                    .with_status_code(200)
-                    .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
-                Err(e) => Response::from_string(format!("Error reading {}: {}", org_path.display(), e))
-                    .with_status_code(500),
+            if md_path.exists() {
+                match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html(&s, theme)) {
+                    Ok(html) => Response::from_string(html)
+                        .with_status_code(200)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+                    Err(e) => Response::from_string(format!("Error reading {}: {}", md_path.display(), e))
+                        .with_status_code(500),
+                }
+            } else if org_path.exists() {
+                match fs::read_to_string(&org_path).map(|s| convert_org_to_html(&s, theme)) {
+                    Ok(html) => Response::from_string(html)
+                        .with_status_code(200)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+                    Err(e) => Response::from_string(format!("Error reading {}: {}", org_path.display(), e))
+                        .with_status_code(500),
+                }
+            } else {
+                Response::from_string("Not Found").with_status_code(404)
             }
         } else {
-            Response::from_string("Not Found").with_status_code(404)
+            // Serve static file from src/
+            let static_path = src_dir.join(path);
+            if static_path.is_file() {
+                match fs::read(&static_path) {
+                    Ok(bytes) => {
+                        let mime = mime_guess::from_path(&static_path).first_or_octet_stream();
+                        let mut resp = Response::from_data(bytes).with_status_code(200);
+                        let header = Header::from_bytes(&b"Content-Type"[..], mime.to_string().as_bytes()).unwrap();
+                        resp = resp.with_header(header);
+                        resp
+                    }
+                    Err(e) => Response::from_string(format!("Error reading {}: {}", static_path.display(), e)).with_status_code(500),
+                }
+            } else {
+                Response::from_string("Not Found").with_status_code(404)
+            }
         };
 
         let _ = request.respond(resp);
@@ -271,10 +304,19 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     let syn_auto_dark = format!("@media (prefers-color-scheme: dark) {{\n{}\n}}", scope_syntect_css(&syn_css_dark, r#"html[data-theme='auto']"#));
 
     let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n";
+    let head_extra = read_head_snippet().unwrap_or_default();
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n</body>\n</html>",
-        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, controls_html, body, toggle_script
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n</body>\n</html>",
+        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script
     )
+}
+
+fn read_head_snippet() -> Option<String> {
+    let path = Path::new("theme").join("head.html");
+    match fs::read_to_string(&path) {
+        Ok(s) => Some(s),
+        Err(_) => None,
+    }
 }
 
 fn extract_title_from_markdown(input: &str) -> Option<String> {

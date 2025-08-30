@@ -39,6 +39,7 @@ haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME]
 - Dynamic HTML `<title>` from first heading/`#+TITLE`
 - Server-side code highlighting with `syntect` (no CDN)
 - Theme selection via `--theme-light` / `--theme-dark`
+- Static assets: copies non-`.md`/`.org` files from `src/` to `output/` during build, and serves them directly during `serve` with proper Content-Type.
 
 ## Configuration
 
@@ -58,6 +59,10 @@ haystack themes
 ```
 
 Prints all theme names available in syntect’s default theme set.
+
+### Custom head include
+
+- If `theme/head.html` exists (relative to the working directory), its contents are injected into the `<head>` of every page (both build and serve). Useful for custom meta tags, analytics, fonts, or additional styles.
 
 ## Examples
 
