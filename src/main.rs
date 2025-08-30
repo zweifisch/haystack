@@ -305,9 +305,23 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
 
     let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n";
     let head_extra = read_head_snippet().unwrap_or_default();
+    let indicator_script = r#"(function(){
+  function render(){
+    var btn = document.getElementById('themeToggle'); if(!btn) return;
+    var mode = document.documentElement.getAttribute('data-theme')||'auto';
+    btn.setAttribute('data-mode', mode);
+    var label = (mode==='light'?'Light':(mode==='dark'?'Dark':'Auto'));
+    btn.setAttribute('aria-label', 'Toggle theme (current: '+label+')');
+    btn.title = 'Theme: '+label+' (click to switch)';
+    btn.textContent = (mode==='light'?'\u2600':(mode==='dark'?'\u263D':'A'));
+  }
+  render();
+  var btn = document.getElementById('themeToggle'); if(btn){ btn.addEventListener('click', function(){ setTimeout(render,0); }); }
+  var obs = new MutationObserver(render); obs.observe(document.documentElement, { attributes:true, attributeFilter:['data-theme']});
+})();"#;
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n</body>\n</html>",
-        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
+        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script
     )
 }
 
@@ -382,40 +396,98 @@ fn extract_title_from_org(input: &str) -> Option<String> {
 }
 
 fn default_css() -> &'static str {
-    r#":root { --fg: #1f2328; --bg: #ffffff; --muted: #667085; --link: #0a66c2; --border: #e5e7eb; --code-bg: #f6f8fa; }
-[data-theme='dark'] { --fg: #e6edf3; --bg: #0d1117; --muted: #9aa4b2; --link: #79b8ff; --border: #30363d; --code-bg: #161b22; }
-@media (prefers-color-scheme: dark) { [data-theme='auto'] { --fg: #e6edf3; --bg: #0d1117; --muted: #9aa4b2; --link: #79b8ff; --border: #30363d; --code-bg: #161b22; } }
+    r#":root {
+  --fg: #222222;
+  --bg: #f7f4e9; /* retro paper */
+  --muted: #6b665e;
+  --link: #2f6f6f; /* teal-ish retro */
+  --border: #d9d4c7;
+  --code-bg: #efe9d6;
+  --shadow: rgba(0,0,0,0.04);
+}
+[data-theme='dark'] {
+  --fg: #e6e1cf;
+  --bg: #0e0f13;
+  --muted: #9a968a;
+  --link: #7fd1b9;
+  --border: #2a2c33;
+  --code-bg: #151821;
+  --shadow: rgba(0,0,0,0.25);
+}
+@media (prefers-color-scheme: dark) {
+  [data-theme='auto'] {
+    --fg: #e6e1cf;
+    --bg: #0e0f13;
+    --muted: #9a968a;
+    --link: #7fd1b9;
+    --border: #2a2c33;
+    --code-bg: #151821;
+    --shadow: rgba(0,0,0,0.25);
+  }
+}
 html, body { padding: 0; margin: 0; background: var(--bg); color: var(--fg); }
-body { font: 16px/1.65 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, \"Apple Color Emoji\", \"Segoe UI Emoji\"; }
-.container { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+body {
+  font-family: ui-serif, Georgia, Times, \"Noto Serif\", serif;
+  font-size: 17px;
+  line-height: 1.7;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.container { max-width: 70ch; margin: 0 auto; padding: 28px 18px 48px; }
 
-.theme-controls { position: sticky; top: 0; display: flex; justify-content: flex-end; padding: 12px 16px 0; }
-.theme-controls button { border: 1px solid var(--border); background: var(--code-bg); color: var(--fg); border-radius: 999px; padding: 6px 10px; cursor: pointer; }
-.theme-controls button:hover { filter: brightness(0.97); }
+.theme-controls { position: sticky; top: 0; display: flex; justify-content: flex-end; padding: 10px 18px 0; }
+.theme-controls button {
+  border: 1px solid var(--fg);
+  background: transparent;
+  color: var(--fg);
+  border-radius: 999px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;
+  font-size: 0.9rem;
+}
+.theme-controls button[data-mode='auto'] {
+  border-style: dashed;
+  letter-spacing: 0.06em;
+}
+.theme-controls button:hover { background: var(--code-bg); }
 
-h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.5em 0 0.6em; }
-h1 { font-size: 2rem; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin: 1.6em 0 0.7em; font-weight: 700; letter-spacing: 0.02em; }
+h1 { font-size: 2.1rem; }
 h2 { font-size: 1.6rem; }
 h3 { font-size: 1.25rem; }
 h4 { font-size: 1.1rem; }
 p { margin: 1em 0; }
-a { color: var(--link); text-decoration: none; }
-a:hover { text-decoration: underline; }
-img, video { max-width: 100%; height: auto; }
-hr { border: 0; border-top: 1px solid var(--border); margin: 2rem 0; }
-ul, ol { padding-left: 1.25rem; }
-li { margin: 0.3rem 0; }
-blockquote { margin: 1rem 0; padding: 0.75rem 1rem; border-left: 3px solid var(--border); color: var(--muted); background: color-mix(in srgb, var(--code-bg) 60%, transparent); }
-code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; font-size: 0.95em; }
-pre { background: var(--code-bg); padding: 0.9rem; border-radius: 8px; overflow: auto; border: 1px solid var(--border); }
-code { background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 6px; }
+a { color: var(--link); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; text-decoration-skip-ink: auto; }
+a:hover { opacity: 0.9; }
+::selection { background: color-mix(in srgb, var(--link) 25%, transparent); }
+img, video { max-width: 100%; height: auto; border-radius: 2px; box-shadow: 0 1px 0 var(--shadow); }
+hr { border: 0; border-top: 1px dashed var(--border); margin: 2.2rem 0; }
+ul, ol { padding-left: 1.2rem; }
+li { margin: 0.35rem 0; }
+blockquote {
+  margin: 1.2rem 0; padding: 0.75rem 1rem; border-left: 3px solid var(--border);
+  color: var(--muted); background: color-mix(in srgb, var(--code-bg) 65%, transparent);
+  font-style: italic;
+}
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;
+  font-size: 0.95em;
+}
+pre {
+  background: var(--code-bg);
+  padding: 0.9rem; border-radius: 6px; overflow: auto; border: 1px solid var(--border);
+}
+code { background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 4px; }
 pre code { padding: 0; background: transparent; }
-table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+table { width: 100%; border-collapse: collapse; margin: 1.2rem 0; }
 th, td { padding: 0.5rem 0.6rem; border: 1px solid var(--border); text-align: left; }
 thead th { background: color-mix(in srgb, var(--code-bg) 85%, transparent); }
-details { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0.9rem; background: color-mix(in srgb, var(--code-bg) 75%, transparent); }
+details { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.9rem; background: color-mix(in srgb, var(--code-bg) 75%, transparent); }
 summary { cursor: pointer; font-weight: 600; }
-@media (min-width: 900px) { body { font-size: 17px; } .container { padding: 32px 20px; } }
+kbd { font-family: inherit; background: var(--code-bg); border: 1px solid var(--border); border-bottom-width: 2px; padding: 0 0.35rem; border-radius: 4px; }
+@media (min-width: 900px) { body { font-size: 18px; } .container { padding: 36px 22px 56px; } }
 "#
 }
 
