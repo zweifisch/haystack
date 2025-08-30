@@ -4,10 +4,16 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use pulldown_cmark::{html, Event, Options, Parser as MdParser, Tag, TagEnd};
+use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser as MdParser, Tag, TagEnd};
 use tiny_http::{Header, Response, Server};
 use walkdir::WalkDir;
 use orgize::Org;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGenerator};
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::util::LinesWithEndings;
 
 #[derive(Parser, Debug)]
 #[command(name = "haystack", version, about = "Build and serve markdown/org to HTML")]
@@ -19,34 +25,60 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Compile src/*.md and src/*.org to output/*.html
-    Build,
+    Build {
+        /// Light theme name for syntax highlighting (syntect)
+        #[arg(long, value_name = "NAME")]
+        theme_light: Option<String>,
+        /// Dark theme name for syntax highlighting (syntect)
+        #[arg(long, value_name = "NAME")]
+        theme_dark: Option<String>,
+    },
     /// Serve on-demand HTML from src/*.md and src/*.org
     Serve {
         /// Port to listen on
         #[arg(long, default_value_t = 4000)]
         port: u16,
+        /// Light theme name for syntax highlighting (syntect)
+        #[arg(long, value_name = "NAME")]
+        theme_light: Option<String>,
+        /// Dark theme name for syntax highlighting (syntect)
+        #[arg(long, value_name = "NAME")]
+        theme_dark: Option<String>,
     },
+    /// List available syntax highlighting themes
+    Themes,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ThemeConfig {
+    light: Option<String>,
+    dark: Option<String>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build => {
+        Commands::Build { theme_light, theme_dark } => {
             let src = Path::new("src");
             let out = Path::new("output");
-            build_all(src, out)?;
+            let theme = ThemeConfig { light: theme_light, dark: theme_dark };
+            build_all(src, out, &theme)?;
         }
-        Commands::Serve { port } => {
+        Commands::Serve { port, theme_light, theme_dark } => {
             let src = Path::new("src");
-            serve(port, src)?;
+            let theme = ThemeConfig { light: theme_light, dark: theme_dark };
+            serve(port, src, &theme)?;
+        }
+        Commands::Themes => {
+            list_themes();
         }
     }
 
     Ok(())
 }
 
-fn build_all(src_dir: &Path, out_dir: &Path) -> Result<()> {
+fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
@@ -68,7 +100,7 @@ fn build_all(src_dir: &Path, out_dir: &Path) -> Result<()> {
                         fs::create_dir_all(parent)?;
                     }
 
-                    let html = convert_file(path)?;
+                    let html = convert_file(path, theme)?;
                     fs::write(&out_path, html).with_context(|| format!(
                         "writing output file {}",
                         out_path.display()
@@ -86,7 +118,7 @@ fn build_all(src_dir: &Path, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn serve(port: u16, src_dir: &Path) -> Result<()> {
+fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
@@ -113,7 +145,7 @@ fn serve(port: u16, src_dir: &Path) -> Result<()> {
         let org_path = src_dir.join(format!("{}.org", base));
 
         let resp = if md_path.exists() {
-            match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html(&s)) {
+            match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html(&s, theme)) {
                 Ok(html) => Response::from_string(html)
                     .with_status_code(200)
                     .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
@@ -121,7 +153,7 @@ fn serve(port: u16, src_dir: &Path) -> Result<()> {
                     .with_status_code(500),
             }
         } else if org_path.exists() {
-            match fs::read_to_string(&org_path).map(|s| convert_org_to_html(&s)) {
+            match fs::read_to_string(&org_path).map(|s| convert_org_to_html(&s, theme)) {
                 Ok(html) => Response::from_string(html)
                     .with_status_code(200)
                     .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
@@ -138,7 +170,7 @@ fn serve(port: u16, src_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn convert_file(path: &Path) -> Result<String> {
+fn convert_file(path: &Path, theme: &ThemeConfig) -> Result<String> {
     let mut file = fs::File::open(path)
         .with_context(|| format!("opening input file {}", path.display()))?;
     let mut buf = String::new();
@@ -146,40 +178,80 @@ fn convert_file(path: &Path) -> Result<String> {
         .with_context(|| format!("reading input file {}", path.display()))?;
 
     match path.extension().and_then(|s| s.to_str()) {
-        Some("md") => Ok(convert_markdown_to_html(&buf)),
-        Some("org") => Ok(convert_org_to_html(&buf)),
+        Some("md") => Ok(convert_markdown_to_html(&buf, theme)),
+        Some("org") => Ok(convert_org_to_html(&buf, theme)),
         other => Err(anyhow!("unsupported extension {:?} for {}", other, path.display())),
     }
 }
 
-fn convert_markdown_to_html(input: &str) -> String {
+fn convert_markdown_to_html(input: &str, theme: &ThemeConfig) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     let parser = MdParser::new_ext(input, options);
+
+    // Transform code blocks into syntect-highlighted HTML
+    let mut events = Vec::new();
+    let mut in_code = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_buf = String::new();
+
+    for ev in parser {
+        match ev {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                in_code = true;
+                code_buf.clear();
+                code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => {
+                        let first = info.split_whitespace().next().unwrap_or("");
+                        if first.is_empty() { None } else { Some(first.to_string()) }
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+            }
+            Event::Text(t) if in_code => {
+                code_buf.push_str(&t);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                let html_snippet = highlight_code(&code_buf, code_lang.as_deref());
+                events.push(Event::Html(CowStr::from(html_snippet)));
+                in_code = false;
+                code_lang = None;
+            }
+            other => {
+                if !in_code {
+                    events.push(other);
+                }
+            }
+        }
+    }
+
     let mut out = String::new();
-    html::push_html(&mut out, parser);
+    html::push_html(&mut out, events.into_iter());
     let title = extract_title_from_markdown(input);
-    wrap_html_page(out, title)
+    wrap_html_page(out, title, theme)
 }
 
 // Minimal Org-mode to HTML converter: supports headings, lists, paragraphs.
-fn convert_org_to_html(input: &str) -> String {
+fn convert_org_to_html(input: &str, theme: &ThemeConfig) -> String {
     let org = Org::parse(input);
     let mut bytes: Vec<u8> = Vec::new();
     let _ = org.write_html(&mut bytes);
     let body = String::from_utf8(bytes).unwrap_or_default();
     let title = extract_title_from_org(input);
-    wrap_html_page(body, title)
+    let body = highlight_code_blocks_in_html(&body);
+    wrap_html_page(body, title, theme)
 }
 
-fn wrap_html_page(body: String, title: Option<String>) -> String {
+fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> String {
     let css = default_css();
+    let (syn_css_light, syn_css_dark) = syntax_css(theme.light.as_deref(), theme.dark.as_deref());
     let page_title = title.as_deref().unwrap_or("haystack");
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{page_title}</title>\n<style>\n{css}\n</style>\n</head>\n<body>\n<main class=\"container\">\n{body}\n</main>\n</body>\n</html>",
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<style>\n{}\n@media (prefers-color-scheme: light) {{\n{}\n}}\n@media (prefers-color-scheme: dark) {{\n{}\n}}\n</style>\n</head>\n<body>\n<main class=\"container\">\n{}\n</main>\n</body>\n</html>",
+        page_title, css, syn_css_light, syn_css_dark, body
     )
 }
 
@@ -278,4 +350,133 @@ details { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem 0
 summary { cursor: pointer; font-weight: 600; }
 @media (min-width: 900px) { body { font-size: 17px; } .container { padding: 32px 20px; } }
 "#
+}
+
+static SYNTAX_SET: Lazy<SyntaxSet> = Lazy::new(|| SyntaxSet::load_defaults_newlines());
+static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
+
+fn syntax_css(light_name: Option<&str>, dark_name: Option<&str>) -> (String, String) {
+    let light_theme = resolve_theme(light_name).unwrap_or_else(|| {
+        eprintln!("[haystack] theme-light not found, using InspiredGitHub/base16-ocean.light fallback");
+        THEME_SET
+            .themes
+            .get("InspiredGitHub")
+            .or_else(|| THEME_SET.themes.get("base16-ocean.light"))
+            .expect("InspiredGitHub or base16-ocean.light theme present")
+    });
+
+    let dark_theme = resolve_theme(dark_name).unwrap_or_else(|| {
+        eprintln!("[haystack] theme-dark not found, using base16-ocean.dark/Solarized (dark) fallback");
+        THEME_SET
+            .themes
+            .get("base16-ocean.dark")
+            .or_else(|| THEME_SET.themes.get("Solarized (dark)"))
+            .expect("base16-ocean.dark or Solarized (dark) theme present")
+    });
+    let light = css_for_theme_with_class_style(light_theme, ClassStyle::Spaced).unwrap_or_default();
+    let dark = css_for_theme_with_class_style(dark_theme, ClassStyle::Spaced).unwrap_or_default();
+    (light, dark)
+}
+
+fn resolve_theme(name: Option<&str>) -> Option<&'static Theme> {
+    let name = name?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // 1) Exact match
+    if let Some(t) = THEME_SET.themes.get(name) {
+        return Some(t);
+    }
+    // 2) Case-insensitive exact
+    let lower = name.to_ascii_lowercase();
+    if let Some((_, t)) = THEME_SET
+        .themes
+        .iter()
+        .find(|(k, _)| k.to_ascii_lowercase() == lower)
+    {
+        return Some(t);
+    }
+    // 3) Normalized (remove non-alnum)
+    let norm = normalize_name(name);
+    if let Some((_, t)) = THEME_SET
+        .themes
+        .iter()
+        .find(|(k, _)| normalize_name(k) == norm)
+    {
+        return Some(t);
+    }
+    // 4) Aliases
+    let alias = match lower.as_str() {
+        "github" | "inspiredgithub" => Some("InspiredGitHub"),
+        "solarized-dark" | "solarized(dark)" => Some("Solarized (dark)"),
+        "solarized-light" | "solarized(light)" => Some("Solarized (light)"),
+        "ocean-dark" | "base16-ocean-dark" => Some("base16-ocean.dark"),
+        "ocean-light" | "base16-ocean-light" => Some("base16-ocean.light"),
+        _ => None,
+    };
+    alias.and_then(|a| THEME_SET.themes.get(a))
+}
+
+fn normalize_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn list_themes() {
+    let mut names: Vec<&str> = THEME_SET.themes.keys().map(|s| s.as_str()).collect();
+    names.sort_unstable_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    println!("Available themes ({}):", names.len());
+    for n in names {
+        println!("- {}", n);
+    }
+}
+
+fn highlight_code(code: &str, lang: Option<&str>) -> String {
+    let ss: &SyntaxSet = &SYNTAX_SET;
+    let syntax: &SyntaxReference = match lang {
+        Some(l) => ss.find_syntax_by_token(l).unwrap_or_else(|| ss.find_syntax_plain_text()),
+        None => ss.find_syntax_plain_text(),
+    };
+    let mut generator = ClassedHTMLGenerator::new_with_class_style(syntax, ss, ClassStyle::Spaced);
+    for line in LinesWithEndings::from(code) {
+        let _ = generator.parse_html_for_line_which_includes_newline(line);
+    }
+    let highlighted = generator.finalize();
+    let class_lang = lang.unwrap_or("text");
+    format!("<pre><code class=\"hl language-{}\">{}</code></pre>", class_lang, highlighted)
+}
+
+fn highlight_code_blocks_in_html(input_html: &str) -> String {
+    static RE_MD: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?s)<pre><code class=\"language-([A-Za-z0-9_+\-.#]+)\">(.*?)</code></pre>"#).unwrap()
+    });
+    static RE_ORG: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?s)<pre class=\"src src-([A-Za-z0-9_+\-.#]+)\">(.*?)</pre>"#).unwrap()
+    });
+
+    let unescape = |s: &str| -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+    };
+
+    let tmp = RE_MD.replace_all(input_html, |caps: &regex::Captures| {
+        let lang = caps.get(1).map(|m| m.as_str()).unwrap_or("text");
+        let code_escaped = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let code = unescape(code_escaped);
+        highlight_code(&code, Some(lang))
+    });
+
+    let tmp = RE_ORG.replace_all(&tmp, |caps: &regex::Captures| {
+        let lang = caps.get(1).map(|m| m.as_str()).unwrap_or("text");
+        let code_escaped = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        let code = unescape(code_escaped);
+        highlight_code(&code, Some(lang))
+    });
+
+    tmp.into_owned()
 }
