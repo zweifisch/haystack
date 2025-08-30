@@ -249,9 +249,31 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     let css = default_css();
     let (syn_css_light, syn_css_dark) = syntax_css(theme.light.as_deref(), theme.dark.as_deref());
     let page_title = title.as_deref().unwrap_or("haystack");
+    let theme_bootstrap = r#"(function(){
+  try {
+    document.documentElement.setAttribute('data-theme', localStorage.getItem('haystack-theme') || 'auto');
+  } catch(e) {}
+})();"#;
+    let controls_html = r#"<div class="theme-controls"><button id="themeToggle" aria-label="Toggle theme">🌓</button></div>"#;
+    let toggle_script = r#"(function(){
+  function setTheme(t){ document.documentElement.setAttribute('data-theme', t); try{ localStorage.setItem('haystack-theme', t); }catch(e){} }
+  const btn = document.getElementById('themeToggle');
+  if(btn){ btn.addEventListener('click', function(){
+    const cur = document.documentElement.getAttribute('data-theme')||'auto';
+    const next = (cur==='light') ? 'dark' : (cur==='dark' ? 'auto' : 'light');
+    setTheme(next);
+  }); }
+})();"#;
+    // Prepare syntect CSS for light/dark and auto (media-driven)
+    let syn_light_scoped = scope_syntect_css(&syn_css_light, r#"html[data-theme='light']"#);
+    let syn_dark_scoped = scope_syntect_css(&syn_css_dark, r#"html[data-theme='dark']"#);
+    let syn_auto_light = format!("@media (prefers-color-scheme: light) {{\n{}\n}}", scope_syntect_css(&syn_css_light, r#"html[data-theme='auto']"#));
+    let syn_auto_dark = format!("@media (prefers-color-scheme: dark) {{\n{}\n}}", scope_syntect_css(&syn_css_dark, r#"html[data-theme='auto']"#));
+
+    let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n";
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<style>\n{}\n@media (prefers-color-scheme: light) {{\n{}\n}}\n@media (prefers-color-scheme: dark) {{\n{}\n}}\n</style>\n</head>\n<body>\n<main class=\"container\">\n{}\n</main>\n</body>\n</html>",
-        page_title, css, syn_css_light, syn_css_dark, body
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n</body>\n</html>",
+        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, controls_html, body, toggle_script
     )
 }
 
@@ -319,12 +341,15 @@ fn extract_title_from_org(input: &str) -> Option<String> {
 
 fn default_css() -> &'static str {
     r#":root { --fg: #1f2328; --bg: #ffffff; --muted: #667085; --link: #0a66c2; --border: #e5e7eb; --code-bg: #f6f8fa; }
-@media (prefers-color-scheme: dark) {
-  :root { --fg: #e6edf3; --bg: #0d1117; --muted: #9aa4b2; --link: #79b8ff; --border: #30363d; --code-bg: #161b22; }
-}
+[data-theme='dark'] { --fg: #e6edf3; --bg: #0d1117; --muted: #9aa4b2; --link: #79b8ff; --border: #30363d; --code-bg: #161b22; }
+@media (prefers-color-scheme: dark) { [data-theme='auto'] { --fg: #e6edf3; --bg: #0d1117; --muted: #9aa4b2; --link: #79b8ff; --border: #30363d; --code-bg: #161b22; } }
 html, body { padding: 0; margin: 0; background: var(--bg); color: var(--fg); }
 body { font: 16px/1.65 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, \"Apple Color Emoji\", \"Segoe UI Emoji\"; }
 .container { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+
+.theme-controls { position: sticky; top: 0; display: flex; justify-content: flex-end; padding: 12px 16px 0; }
+.theme-controls button { border: 1px solid var(--border); background: var(--code-bg); color: var(--fg); border-radius: 999px; padding: 6px 10px; cursor: pointer; }
+.theme-controls button:hover { filter: brightness(0.97); }
 
 h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.5em 0 0.6em; }
 h1 { font-size: 2rem; }
@@ -357,7 +382,9 @@ static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 
 fn syntax_css(light_name: Option<&str>, dark_name: Option<&str>) -> (String, String) {
     let light_theme = resolve_theme(light_name).unwrap_or_else(|| {
-        eprintln!("[haystack] theme-light not found, using InspiredGitHub/base16-ocean.light fallback");
+        if !light_name.is_none() {
+            eprintln!("[haystack] theme-light not found, using InspiredGitHub/base16-ocean.light fallback");
+        }
         THEME_SET
             .themes
             .get("InspiredGitHub")
@@ -366,7 +393,9 @@ fn syntax_css(light_name: Option<&str>, dark_name: Option<&str>) -> (String, Str
     });
 
     let dark_theme = resolve_theme(dark_name).unwrap_or_else(|| {
-        eprintln!("[haystack] theme-dark not found, using base16-ocean.dark/Solarized (dark) fallback");
+        if !dark_name.is_none() {
+            eprintln!("[haystack] theme-dark not found, using base16-ocean.dark/Solarized (dark) fallback");
+        }
         THEME_SET
             .themes
             .get("base16-ocean.dark")
@@ -376,6 +405,28 @@ fn syntax_css(light_name: Option<&str>, dark_name: Option<&str>) -> (String, Str
     let light = css_for_theme_with_class_style(light_theme, ClassStyle::Spaced).unwrap_or_default();
     let dark = css_for_theme_with_class_style(dark_theme, ClassStyle::Spaced).unwrap_or_default();
     (light, dark)
+}
+
+fn scope_syntect_css(css: &str, scope: &str) -> String {
+    // Naively prefix each CSS rule's selectors with the scope.
+    // This avoids selector collisions between light/dark theme rules.
+    let mut out = String::new();
+    for chunk in css.split('}') {
+        if let Some((selectors, body)) = chunk.split_once('{') {
+            let scoped_selectors = selectors
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("{} {}", scope, s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&scoped_selectors);
+            out.push_str("{\n");
+            out.push_str(body);
+            out.push_str("}\n");
+        }
+    }
+    out
 }
 
 fn resolve_theme(name: Option<&str>) -> Option<&'static Theme> {
