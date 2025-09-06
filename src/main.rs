@@ -298,6 +298,10 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     let theme_bootstrap = r#"(function(){
   try {
     document.documentElement.setAttribute('data-theme', localStorage.getItem('haystack-theme') || 'auto');
+    var ua = navigator.userAgent || '';
+    if (/micromessenger/i.test(ua)) {
+      document.documentElement.setAttribute('data-hide-share', '1');
+    }
   } catch(e) {}
 })();"#;
     let share_script = r#"(function(){
@@ -381,7 +385,7 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     let syn_auto_light = format!("@media (prefers-color-scheme: light) {{\n{}\n}}", scope_syntect_css(&syn_css_light, r#"html[data-theme='auto']"#));
     let syn_auto_dark = format!("@media (prefers-color-scheme: dark) {{\n{}\n}}", scope_syntect_css(&syn_css_dark, r#"html[data-theme='auto']"#));
 
-    let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n/* Controls spacing */\n.theme-controls button + button { margin-left: 8px; }\n";
+    let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n/* Controls spacing */\n.theme-controls button + button { margin-left: 8px; }\n/* Hide share button for WeChat in-app browser */\nhtml[data-hide-share='1'] #shareBtn { display: none !important; }\n";
     let head_extra = read_head_snippet().unwrap_or_default();
     let indicator_script = r#"(function(){
   function render(){
@@ -506,8 +510,8 @@ fn default_css() -> &'static str {
 html, body { padding: 0; margin: 0; background: var(--bg); color: var(--fg); }
 body {
   font-family: ui-serif, Georgia, Times, \"Noto Serif\", serif;
-  font-size: 17px;
-  line-height: 1.7;
+  font-size: 18px;
+  line-height: 1.6;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -565,6 +569,7 @@ thead th { background: color-mix(in srgb, var(--code-bg) 85%, transparent); }
 details { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.9rem; background: color-mix(in srgb, var(--code-bg) 75%, transparent); }
 summary { cursor: pointer; font-weight: 600; }
 kbd { font-family: inherit; background: var(--code-bg); border: 1px solid var(--border); border-bottom-width: 2px; padding: 0 0.35rem; border-radius: 4px; }
+@media (max-width: 600px) { body { font-size: 19px; } .container { padding: 0 22px 56px; } }
 @media (min-width: 900px) { body { font-size: 18px; } .container { padding: 36px 22px 56px; } }
 "#
 }
