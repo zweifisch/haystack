@@ -154,12 +154,25 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig) -> Result<()> {
             continue;
         }
 
-        let resp = if path.ends_with(".html") {
-            let base = &path[..path.len() - ".html".len()];
+        // Determine routing: HTML page (md/org) vs. static file
+        let has_ext = std::path::Path::new(path).extension().is_some();
+        let is_html_route = path.ends_with(".html") || !has_ext;
+
+        let resp = if is_html_route {
+            let base = if path.ends_with(".html") { &path[..path.len() - ".html".len()] } else { path };
+            let html_path = src_dir.join(format!("{}.html", base));
             let md_path = src_dir.join(format!("{}.md", base));
             let org_path = src_dir.join(format!("{}.org", base));
 
-            if md_path.exists() {
+            if html_path.exists() {
+                match fs::read_to_string(&html_path) {
+                    Ok(s) => Response::from_string(s)
+                        .with_status_code(200)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+                    Err(e) => Response::from_string(format!("Error reading {}: {}", html_path.display(), e))
+                        .with_status_code(500),
+                }
+            } else if md_path.exists() {
                 match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html(&s, theme)) {
                     Ok(html) => Response::from_string(html)
                         .with_status_code(200)
