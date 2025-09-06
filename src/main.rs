@@ -300,7 +300,72 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     document.documentElement.setAttribute('data-theme', localStorage.getItem('haystack-theme') || 'auto');
   } catch(e) {}
 })();"#;
-    let controls_html = r#"<div class="theme-controls"><button id="themeToggle" aria-label="Toggle theme">🌓</button></div>"#;
+    let share_script = r#"(function(){
+  function loadHtml2Canvas(){
+    return new Promise(function(resolve, reject){
+      if(window.html2canvas){ resolve(window.html2canvas); return; }
+      var s = document.createElement('script');
+      s.src = 'https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js';
+      s.onload = function(){ resolve(window.html2canvas); };
+      s.onerror = function(){ reject(new Error('Failed to load html2canvas')); };
+      document.head.appendChild(s);
+    });
+  }
+  function filenameFromTitle(){
+    var t = document.title || 'page';
+    return t.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || 'page';
+  }
+  function notify(btn, msg){
+    if(!btn) { try{ alert(msg); }catch(e){} return; }
+    var orig = btn.textContent;
+    btn.textContent = msg;
+    btn.disabled = true;
+    setTimeout(function(){ btn.textContent = orig; btn.disabled = false; }, 1400);
+  }
+  async function shareOrDownload(canvas, btn){
+    return new Promise(function(resolve){ canvas.toBlob(async function(blob){
+      if(!blob){ notify(btn,'Failed'); resolve(); return; }
+      var file = new File([blob], filenameFromTitle()+'.png', { type: 'image/png' });
+      try {
+        if(navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share){
+          await navigator.share({ files: [file], title: document.title, text: window.location.href });
+          notify(btn, 'Shared'); resolve(); return;
+        }
+      } catch(e){ /* ignore and fallback */ }
+      try {
+        if(navigator.clipboard && window.ClipboardItem){
+          await navigator.clipboard.write([ new ClipboardItem({ 'image/png': blob }) ]);
+          notify(btn, 'Copied'); resolve(); return;
+        }
+      } catch(e){ /* ignore and fallback */ }
+      // Fallback: trigger download
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filenameFromTitle()+'.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1500);
+      notify(btn, 'Saved'); resolve();
+    }, 'image/png'); });
+  }
+  async function onShare(){
+    var btn = document.getElementById('shareBtn');
+    if(!btn) return;
+    btn.disabled = true; var prev = btn.textContent; btn.textContent = 'Rendering…';
+    try{
+      var h2c = await loadHtml2Canvas();
+      var target = document.querySelector('main.container') || document.querySelector('.container') || document.body;
+      var bg = getComputedStyle(document.body).backgroundColor || '#ffffff';
+      var canvas = await h2c(target, { backgroundColor: bg, scale: Math.min(window.devicePixelRatio||1, 2) });
+      await shareOrDownload(canvas, btn);
+    } catch(e){
+      console.error(e); try{ alert('Screenshot failed: '+(e && e.message ? e.message : e)); }catch(_){}
+    } finally {
+      btn.disabled = false; btn.textContent = prev;
+    }
+  }
+  var btn = document.getElementById('shareBtn'); if(btn){ btn.addEventListener('click', onShare); }
+})();"#;
+    let controls_html = r#"<div class="theme-controls"><button id="shareBtn" aria-label="Share or save screenshot" title="Share or save screenshot">⇪ Share</button><button id="themeToggle" aria-label="Toggle theme">🌓</button></div>"#;
     let toggle_script = r#"(function(){
   function setTheme(t){ document.documentElement.setAttribute('data-theme', t); try{ localStorage.setItem('haystack-theme', t); }catch(e){} }
   const btn = document.getElementById('themeToggle');
@@ -316,7 +381,7 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     let syn_auto_light = format!("@media (prefers-color-scheme: light) {{\n{}\n}}", scope_syntect_css(&syn_css_light, r#"html[data-theme='auto']"#));
     let syn_auto_dark = format!("@media (prefers-color-scheme: dark) {{\n{}\n}}", scope_syntect_css(&syn_css_dark, r#"html[data-theme='auto']"#));
 
-    let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n";
+    let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n/* Controls spacing */\n.theme-controls button + button { margin-left: 8px; }\n";
     let head_extra = read_head_snippet().unwrap_or_default();
     let indicator_script = r#"(function(){
   function render(){
@@ -333,8 +398,8 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
   var obs = new MutationObserver(render); obs.observe(document.documentElement, { attributes:true, attributeFilter:['data-theme']});
 })();"#;
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
-        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
+        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script
     )
 }
 

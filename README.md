@@ -36,6 +36,7 @@ haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME]
 - Markdown via `pulldown-cmark`
 - Org via `orgize`
 - Responsive, minimal built-in CSS with dark-mode support
+- Built-in Share button to capture and share/download a screenshot of the page content
 - Dynamic HTML `<title>` from first heading/`#+TITLE`
 - Server-side code highlighting with `syntect` (no CDN)
 - Theme selection via `--theme-light` / `--theme-dark`
