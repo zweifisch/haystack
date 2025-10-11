@@ -302,6 +302,23 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     if (/micromessenger/i.test(ua)) {
       document.documentElement.setAttribute('data-hide-share', '1');
     }
+    // MathJax v3: config and loader
+    window.MathJax = window.MathJax || {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$','$$'], ['\\[','\\]']],
+        processEscapes: true,
+        processEnvironments: true
+      },
+      options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
+    };
+    if (!document.getElementById('MathJax-script')) {
+      var mj = document.createElement('script');
+      mj.id = 'MathJax-script';
+      mj.async = true;
+      mj.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js';
+      document.head.appendChild(mj);
+    }
   } catch(e) {}
 })();"#;
     let share_script = r#"(function(){
@@ -377,6 +394,7 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     const cur = document.documentElement.getAttribute('data-theme')||'auto';
     const next = (cur==='light') ? 'dark' : (cur==='dark' ? 'auto' : 'light');
     setTheme(next);
+    try { if(window.MathJax && window.MathJax.typeset){ setTimeout(function(){ MathJax.typeset(); }, 0); } } catch(e){}
   }); }
 })();"#;
     // Prepare syntect CSS for light/dark and auto (media-driven)
@@ -386,6 +404,12 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
     let syn_auto_dark = format!("@media (prefers-color-scheme: dark) {{\n{}\n}}", scope_syntect_css(&syn_css_dark, r#"html[data-theme='auto']"#));
 
     let wrap_overrides = "\n/* Force code wrapping */\n.container pre, .container pre code, .container code.hl, .container pre .hl {\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n  word-break: break-word;\n}\n/* Controls spacing */\n.theme-controls button + button { margin-left: 8px; }\n/* Hide share button for WeChat in-app browser */\nhtml[data-hide-share='1'] #shareBtn { display: none !important; }\n";
+    let fonts_head = r#"
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,200..900;1,200..900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,wght@0,200..900;1,200..900&display=swap" rel="stylesheet">
+"#;
     let head_extra = read_head_snippet().unwrap_or_default();
     let indicator_script = r#"(function(){
   function render(){
@@ -402,8 +426,8 @@ fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> S
   var obs = new MutationObserver(render); obs.observe(document.documentElement, { attributes:true, attributeFilter:['data-theme']});
 })();"#;
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
-        page_title, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
+        page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script
     )
 }
 
@@ -509,16 +533,16 @@ fn default_css() -> &'static str {
 }
 html, body { padding: 0; margin: 0; background: var(--bg); color: var(--fg); }
 body {
-  font-family: ui-serif, Georgia, Times, \"Noto Serif\", serif;
+  font-family: "Source Serif Pro Variable", "Source Serif 4", "Times New Roman", Times, serif;
   font-size: 18px;
   line-height: 1.6;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
-.container { max-width: 70ch; margin: 0 auto; padding: 28px 18px 48px; }
+.container { max-width: 90ch; margin: 0 auto; padding: 28px 18px 48px; }
 
-.theme-controls { position: sticky; top: 0; display: flex; justify-content: flex-end; padding: 10px 18px 0; }
+.theme-controls { position: absolute; top: 0; right: 0; display: flex; justify-content: flex-end; padding: 10px 18px 0; }
 .theme-controls button {
   border: 1px solid var(--fg);
   background: transparent;
@@ -526,7 +550,7 @@ body {
   border-radius: 999px;
   padding: 4px 10px;
   cursor: pointer;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 0.9rem;
 }
 .theme-controls button[data-mode='auto'] {
@@ -535,12 +559,12 @@ body {
 }
 .theme-controls button:hover { background: var(--code-bg); }
 
-h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin: 1.6em 0 0.7em; font-weight: 700; letter-spacing: 0.02em; }
-h1 { font-size: 2.1rem; }
+h1, h2, h3, h4, h5, h6 { line-height: 1.2; margin: 1.4em 0 0.7em; font-weight: 700; letter-spacing: 0.02em; font-family: "Source Sans Variable", "Source Sans 3", Arial, sans-serif; }
+h1 { font-size: 2.2rem; }
 h2 { font-size: 1.6rem; }
 h3 { font-size: 1.25rem; }
 h4 { font-size: 1.1rem; }
-p { margin: 1em 0; }
+p { margin: 1em 0; text-align: justify; }
 a { color: var(--link); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; text-decoration-skip-ink: auto; }
 a:hover { opacity: 0.9; }
 ::selection { background: color-mix(in srgb, var(--link) 25%, transparent); }
@@ -569,8 +593,8 @@ thead th { background: color-mix(in srgb, var(--code-bg) 85%, transparent); }
 details { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.9rem; background: color-mix(in srgb, var(--code-bg) 75%, transparent); }
 summary { cursor: pointer; font-weight: 600; }
 kbd { font-family: inherit; background: var(--code-bg); border: 1px solid var(--border); border-bottom-width: 2px; padding: 0 0.35rem; border-radius: 4px; }
-@media (max-width: 600px) { body { font-size: 19px; } .container { padding: 0 22px 56px; } }
-@media (min-width: 900px) { body { font-size: 18px; } .container { padding: 36px 22px 56px; } }
+@media (max-width: 600px) { body { font-size: 20px; } .container { padding: 0 22px 56px; } }
+@media (min-width: 900px) { body { font-size: 19px; } .container { padding: 28px 22px 56px; } }
 "#
 }
 
