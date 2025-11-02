@@ -16,21 +16,27 @@ cargo install --path .
 ### Build site to `output/`:
 
 ```sh
-haystack build [--theme-light NAME] [--theme-dark NAME] [--index]
+haystack build [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES]
 ```
 
 - Scans `src/` for `*.md` and `*.org` (recursively).
 - Writes corresponding `*.html` into `output/`, preserving subdirectories.
 - With `--index`, also writes `output/index.html` with links to all Markdown/Org files.
+ - Multi-language (optional):
+   - Provide `--langs en,zh,fr` (first is default, unprefixed).
+   - Default language lives in `src/`; others in `src/<lang>/`.
+   - Output mirrors this: `output/` (default) and `output/<lang>/` for others.
 
 ### Serve on-demand HTML from `src/`:
 
 ```sh
-haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME]
+haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME] [--langs CODES]
 ```
 
-- Request `/<path>.html` → serves `src/<path>.md` or `src/<path>.org` rendered to HTML.
-- Request `/` → serves a generated index listing links to all Markdown/Org files in `src/`.
+- Request `/<path>.html` → serves `src/<path>.md` or `src/<path>.org` rendered to HTML (default language, unprefixed).
+- Request `/` → serves a generated index for default language.
+- With languages: `/<lang>/...` resolves within `src/<lang>/...` and `/<lang>/` serves that language’s index.
+ - Pages include a language switcher when languages are configured.
 
 ## Features
 
