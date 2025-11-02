@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -32,6 +33,9 @@ enum Commands {
         /// Dark theme name for syntax highlighting (syntect)
         #[arg(long, value_name = "NAME")]
         theme_dark: Option<String>,
+        /// Also generate an index.html listing all docs
+        #[arg(long, default_value_t = false)]
+        index: bool,
     },
     /// Serve on-demand HTML from src/*.md and src/*.org
     Serve {
@@ -59,11 +63,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { theme_light, theme_dark } => {
+        Commands::Build { theme_light, theme_dark, index } => {
             let src = Path::new("src");
             let out = Path::new("output");
             let theme = ThemeConfig { light: theme_light, dark: theme_dark };
-            build_all(src, out, &theme)?;
+            build_all(src, out, &theme, index)?;
         }
         Commands::Serve { port, theme_light, theme_dark } => {
             let src = Path::new("src");
@@ -78,11 +82,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig) -> Result<()> {
+fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, generate_index: bool) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
     fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+
+    // Collect list of markdown/org docs for optional index page
+    let mut doc_paths: Vec<std::path::PathBuf> = Vec::new();
 
     for entry in WalkDir::new(src_dir).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
@@ -90,6 +97,7 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig) -> Result<()> 
             match path.extension().and_then(|s| s.to_str()) {
                 Some("md") | Some("org") => {
                     let rel = path.strip_prefix(src_dir).unwrap();
+                    doc_paths.push(rel.to_path_buf());
                     let mut out_path = out_dir.to_path_buf();
                     let file_stem = rel.with_extension("");
                     // Keep subdirectories structure
@@ -129,6 +137,14 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig) -> Result<()> 
             }
         }
     }
+    if generate_index {
+        // Sort paths for stable output
+        doc_paths.sort_by(|a, b| a.to_string_lossy().to_ascii_lowercase().cmp(&b.to_string_lossy().to_ascii_lowercase()));
+        let index_html = render_index_for_paths(&doc_paths, theme, "Index");
+        let index_path = out_dir.join("index.html");
+        fs::write(&index_path, index_html).with_context(|| format!("writing index {}", index_path.display()))?;
+        println!("Built index -> {}", index_path.display());
+    }
     Ok(())
 }
 
@@ -142,9 +158,30 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig) -> Result<()> {
 
     for request in server.incoming_requests() {
         let url_path = request.url(); // includes leading '/'
-        let mut path = url_path.split('?').next().unwrap_or("").trim_start_matches('/');
+        let path = url_path.split('?').next().unwrap_or("").trim_start_matches('/');
+        // Root route: serve a generated index listing
         if path.is_empty() {
-            path = "index.html";
+            let mut docs: Vec<std::path::PathBuf> = Vec::new();
+            for entry in WalkDir::new(src_dir).into_iter().filter_map(|e| e.ok()) {
+                let p = entry.path();
+                if p.is_file() {
+                    match p.extension().and_then(|s| s.to_str()) {
+                        Some("md") | Some("org") => {
+                            if let Ok(rel) = p.strip_prefix(src_dir) {
+                                docs.push(rel.to_path_buf());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            docs.sort_by(|a, b| a.to_string_lossy().to_ascii_lowercase().cmp(&b.to_string_lossy().to_ascii_lowercase()));
+            let html = render_index_for_paths(&docs, theme, "Index");
+            let resp = Response::from_string(html)
+                .with_status_code(200)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap());
+            let _ = request.respond(resp);
+            continue;
         }
 
         // Basic path traversal guard
@@ -289,6 +326,99 @@ fn convert_org_to_html(input: &str, theme: &ThemeConfig) -> String {
     let title = extract_title_from_org(input);
     let body = highlight_code_blocks_in_html(&body);
     wrap_html_page(body, title, theme)
+}
+
+fn render_index_for_paths(paths: &[std::path::PathBuf], theme: &ThemeConfig, title: &str) -> String {
+    // Build a nested directory tree and render as grouped lists
+    #[derive(Default)]
+    struct DirNode {
+        subdirs: BTreeMap<String, DirNode>,
+        files: Vec<std::path::PathBuf>, // full relative paths
+    }
+
+    fn insert_path(node: &mut DirNode, head: &std::path::Path, full: &std::path::Path) {
+        let mut it = head.iter();
+        let first = match it.next() { Some(s) => s, None => return };
+        let rest: std::path::PathBuf = it.collect();
+        if rest.as_os_str().is_empty() {
+            // At leaf; store the full relative path including directories
+            node.files.push(full.to_path_buf());
+        } else {
+            let key = first.to_string_lossy().to_string();
+            let entry = node.subdirs.entry(key).or_default();
+            insert_path(entry, &rest, full);
+        }
+    }
+
+    fn render_dir(name: Option<&str>, node: &DirNode) -> String {
+        let mut s = String::new();
+        if let Some(n) = name {
+            s.push_str(&format!("<li class=\"dir\"><strong>{}/</strong>\n<ul>\n", escape_html(n)));
+        } else {
+            s.push_str("<ul class=\"index-tree\">\n");
+        }
+        // Files first, sorted by case-insensitive path
+        let mut files = node.files.clone();
+        files.sort_by(|a, b| a.to_string_lossy().to_ascii_lowercase().cmp(&b.to_string_lossy().to_ascii_lowercase()));
+        for rel in files {
+            let html_rel = rel.with_extension("html");
+            let href = html_rel.to_string_lossy().replace('\\', "/");
+            let label = rel
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| rel.to_string_lossy().to_string());
+            let data_name = label.to_ascii_lowercase();
+            s.push_str(&format!("  <li class=\"file\" data-name=\"{}\"><a href=\"/{href}\">{}</a></li>\n", escape_html(&data_name), escape_html(&label)));
+        }
+        // Subdirectories
+        for (subname, subnode) in &node.subdirs {
+            s.push_str(&render_dir(Some(subname.as_str()), subnode));
+        }
+        s.push_str("</ul>\n");
+        if name.is_some() { s.push_str("</li>\n"); }
+        s
+    }
+
+    let mut root = DirNode::default();
+    for rel in paths {
+        insert_path(&mut root, rel, rel);
+    }
+
+    let mut body = String::new();
+    body.push_str(&format!("<h1>{}</h1>\n", escape_html(title)));
+    body.push_str("<div class=\"index-search\"><input type=\"search\" id=\"idxSearch\" placeholder=\"Search...\" aria-label=\"Search documents\"></div>\n");
+    body.push_str(&render_dir(None, &root));
+    body.push_str(r#"
+<script>(function(){
+  var input = document.getElementById('idxSearch');
+  var tree = document.querySelector('.index-tree');
+  if(!input || !tree) return;
+  function filter(){
+    var q = (input.value || '').trim().toLowerCase();
+    var files = tree.querySelectorAll('li.file');
+    files.forEach(function(li){
+      var name = li.getAttribute('data-name') || li.textContent || '';
+      var hide = !!q && name.toLowerCase().indexOf(q) === -1;
+      if(hide) li.classList.add('hidden'); else li.classList.remove('hidden');
+    });
+    var dirs = tree.querySelectorAll('li.dir');
+    dirs.forEach(function(li){
+      var hasVisible = li.querySelector('li.file:not(.hidden), li.dir:not(.hidden)');
+      if(hasVisible) li.classList.remove('hidden'); else li.classList.add('hidden');
+    });
+  }
+  input.addEventListener('input', filter);
+  filter();
+})();</script>
+"#);
+    wrap_html_page(body, Some(title.to_string()), theme)
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> String {
@@ -572,6 +702,14 @@ img, video { max-width: 100%; height: auto; border-radius: 2px; box-shadow: 0 1p
 hr { border: 0; border-top: 1px dashed var(--border); margin: 2.2rem 0; }
 ul, ol { padding-left: 1.2rem; }
 li { margin: 0.35rem 0; }
+/* Index page */
+.index-search { margin: 0.8rem 0 1rem; }
+.index-search input[type='search'] {
+  width: 100%; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--code-bg); color: var(--fg);
+}
+ul.index-tree { list-style: none; padding-left: 0.2rem; }
+ul.index-tree > li.dir > strong { display: inline-block; margin-top: 0.5rem; }
+li.hidden { display: none; }
 blockquote {
   margin: 1.2rem 0; padding: 0.75rem 1rem; border-left: 3px solid var(--border);
   color: var(--muted); background: color-mix(in srgb, var(--code-bg) 65%, transparent);

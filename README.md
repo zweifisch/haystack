@@ -16,11 +16,12 @@ cargo install --path .
 ### Build site to `output/`:
 
 ```sh
-haystack build [--theme-light NAME] [--theme-dark NAME]
+haystack build [--theme-light NAME] [--theme-dark NAME] [--index]
 ```
 
 - Scans `src/` for `*.md` and `*.org` (recursively).
 - Writes corresponding `*.html` into `output/`, preserving subdirectories.
+- With `--index`, also writes `output/index.html` with links to all Markdown/Org files.
 
 ### Serve on-demand HTML from `src/`:
 
@@ -29,7 +30,7 @@ haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME]
 ```
 
 - Request `/<path>.html` → serves `src/<path>.md` or `src/<path>.org` rendered to HTML.
-- Request `/` → serves `src/index.md|org` as `index.html` if present.
+- Request `/` → serves a generated index listing links to all Markdown/Org files in `src/`.
 
 ## Features
 
