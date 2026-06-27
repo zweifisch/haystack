@@ -11,6 +11,19 @@ Tiny CLI to build and serve Markdown/Org files as responsive HTML.
 cargo install --path .
 ```
 
+## Releases
+
+Pushing a semantic version tag such as `v0.2.0` builds Linux x86_64, Linux
+ARM64, and macOS ARM64 archives, generates SHA-256 checksums, and publishes
+them to a GitHub Release.
+
+To build the macOS ARM64 target locally:
+
+```sh
+rustup target add aarch64-apple-darwin
+cargo build --locked --release --target aarch64-apple-darwin
+```
+
 ## Usage
 
 ### Build site to `output/`:
@@ -30,13 +43,63 @@ haystack build [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES
 ### Serve on-demand HTML from `src/`:
 
 ```sh
-haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME] [--langs CODES]
+haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME] [--langs CODES] [--allow-exec]
 ```
 
 - Request `/<path>.html` → serves `src/<path>.md` or `src/<path>.org` rendered to HTML (default language, unprefixed).
 - Request `/` → serves a generated index for default language.
 - With languages: `/<lang>/...` resolves within `src/<lang>/...` and `/<lang>/` serves that language’s index.
  - Pages include a language switcher when languages are configured.
+
+### Executable Markdown code blocks
+
+Pass `--allow-exec` in serve mode to add a **Run** button to supported fenced
+code blocks. Execution is disabled by default and is never enabled in built
+static pages.
+
+Built-in fence languages are `sh`, `bash`, `python`, `py`, `js`,
+`javascript`, `node`, and `codex`. Additional types, or overrides for built-in types,
+are configured in `~/.haystack.toml`. Built-in runners are represented by the
+same configuration schema and loaded as defaults before the user configuration:
+
+The built-in `python` runner uses `uv run -`, so `uv` must be available on
+`PATH`.
+
+```toml
+[code_blocks.codex]
+command = "codex"
+args = ["exec", "--json", "-"]
+output_format = "codex"
+```
+
+`{code}` is replaced with the complete block text as one process argument. If
+no argument contains `{code}`, as in the Codex example, Haystack sends the code
+to the process on standard input. Commands are launched directly without a
+shell.
+
+`output_format` defaults to `"text"`. Set it to `"markdown"` to have Haystack
+render the completed command output as HTML. The `"codex"` renderer parses
+Codex JSONL output, renders agent messages as Markdown, and presents command
+executions, errors, diagnostics, and token usage separately. Text output remains
+streamed; rendered formats are displayed after the command completes.
+
+Fence settings follow the language as whitespace-separated `key=value` pairs:
+
+````markdown
+```python cwd=examples env.MODE=development
+print("hello")
+```
+````
+
+- `cwd` is relative to the Markdown file and must remain inside `src/`.
+- `env.NAME=value` adds an environment variable to the child process.
+- The server re-reads the Markdown and selects the block by ID; code is not
+  accepted from the browser.
+- Output from stdout and stderr is streamed into the rendered page.
+
+Enabling this option permits visitors who can access the server to run marked
+code using the server process's OS permissions. Use it only on trusted content
+and trusted networks.
 
 ## Features
 

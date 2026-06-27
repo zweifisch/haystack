@@ -1,51 +1,93 @@
-name: Build and Release
+name: Release
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-linux-amd64:
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.asset_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_name: haystack-linux-x86_64-musl
+            install_musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset_name: haystack-linux-aarch64-musl
+            install_musl: true
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset_name: haystack-macos-aarch64
+            install_musl: false
 
     steps:
-      - name: Checkout
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Rust
-        # More current than actions-rs/toolchain
+      - name: Install Linux build dependencies
+        if: matrix.install_musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          targets: ${{ matrix.target }}
 
-      - name: Build binary (release)
-        run: cargo build --release
+      - name: Run tests
+        run: cargo test --locked
 
-      - name: Package
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cp target/release/haystack dist/haystack-linux-amd64
-          chmod +x dist/haystack-linux-amd64
-          tar -C dist -czf haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz haystack-linux-amd64
-          sha256sum haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz > haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz.sha256
+          cp "target/${{ matrix.target }}/release/haystack" "dist/${{ matrix.asset_name }}"
+          chmod +x "dist/${{ matrix.asset_name }}"
+          tar -C dist -czf "dist/${{ matrix.asset_name }}.tar.gz" "${{ matrix.asset_name }}"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "dist/${{ matrix.asset_name }}.tar.gz" > "dist/${{ matrix.asset_name }}.tar.gz.sha256"
+          else
+            sha256sum "dist/${{ matrix.asset_name }}.tar.gz" > "dist/${{ matrix.asset_name }}.tar.gz.sha256"
+          fi
 
-      - name: Upload Release Assets
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            dist/${{ matrix.asset_name }}.tar.gz
+            dist/${{ matrix.asset_name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz
-            haystack-${{ github.event.release.tag_name }}-linux-amd64.tar.gz.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            dist/*.tar.gz
+            dist/*.sha256

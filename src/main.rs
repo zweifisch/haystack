@@ -1,16 +1,19 @@
 use std::fs;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::collections::BTreeMap;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser as MdParser, Tag, TagEnd};
-use tiny_http::{Header, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use walkdir::WalkDir;
 use orgize::Org;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde::Deserialize;
 use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGenerator};
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -54,6 +57,9 @@ enum Commands {
         /// Languages (comma-separated). First is default (unprefixed). Example: "en,zh,fr"
         #[arg(long, value_name = "CODES")]
         langs: Option<String>,
+        /// Allow supported Markdown code blocks to be executed from rendered pages
+        #[arg(long, default_value_t = false)]
+        allow_exec: bool,
     },
     /// List available syntax highlighting themes
     Themes,
@@ -117,11 +123,12 @@ fn main() -> Result<()> {
             let lang = LangConfig::new(langs);
             build_all(src, out, &theme, &lang, index)?;
         }
-        Commands::Serve { port, theme_light, theme_dark, langs } => {
+        Commands::Serve { port, theme_light, theme_dark, langs, allow_exec } => {
             let src = Path::new("src");
             let theme = ThemeConfig { light: theme_light, dark: theme_dark };
             let lang = LangConfig::new(langs);
-            serve(port, src, &theme, &lang)?;
+            let execution = ExecutionConfig::load()?;
+            serve(port, src, &theme, &lang, allow_exec, &execution)?;
         }
         Commands::Themes => {
             list_themes();
@@ -169,6 +176,14 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
                         fs::write(&out_path, html).with_context(|| format!("writing output file {}", out_path.display()))?;
                         println!("Built {} -> {}", path.display(), out_path.display());
                     }
+                    Some("html") => {
+                        let rel = path.strip_prefix(&src_root).unwrap();
+                        doc_paths.push(rel.to_path_buf());
+                        let out_path = out_root.join(rel);
+                        if let Some(parent) = out_path.parent() { fs::create_dir_all(parent)?; }
+                        fs::copy(path, &out_path).with_context(|| format!("copying html {} -> {}", path.display(), out_path.display()))?;
+                        println!("Copied {} -> {}", path.display(), out_path.display());
+                    }
                     _ => {
                         // Copy static
                         let rel = path.strip_prefix(&src_root).unwrap();
@@ -204,7 +219,7 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
     Ok(())
 }
 
-fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig) -> Result<()> {
+fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, allow_exec: bool, execution: &ExecutionConfig) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
@@ -213,8 +228,12 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig) 
     let server = Server::http(addr).map_err(|e| anyhow!("server error: {e}"))?;
 
     for request in server.incoming_requests() {
-        let url_path = request.url(); // includes leading '/'
+        let url_path = request.url().to_string(); // includes leading '/'
         let path = url_path.split('?').next().unwrap_or("").trim_start_matches('/');
+        if path == "__haystack/run" {
+            handle_run_request(request, &url_path, src_dir, allow_exec, execution);
+            continue;
+        }
         // Root route: default-language index
         if path.is_empty() {
             let docs = collect_docs_under(src_dir, None, &lang_cfg.others);
@@ -277,7 +296,16 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig) 
                         .with_status_code(500),
                 }
             } else if md_path.exists() {
-                let ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg);
+                let mut ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg);
+                if allow_exec {
+                    let source = match &current_lang {
+                        Some(lang) => format!("{}/{}.md", lang, base_in),
+                        None => format!("{}.md", base_in),
+                    };
+                    let ctx = ctx.get_or_insert_with(PageLangCtx::default);
+                    ctx.exec_source = Some(source);
+                    ctx.exec_languages = execution.languages();
+                }
                 match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html_with_ctx(&s, theme, ctx.as_ref())) {
                     Ok(html) => Response::from_string(html)
                         .with_status_code(200)
@@ -322,6 +350,410 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig) 
     Ok(())
 }
 
+#[derive(Debug)]
+struct MarkdownCodeBlock {
+    language: String,
+    code: String,
+    settings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OutputFormat {
+    #[default]
+    Text,
+    Markdown,
+    Codex,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CodeBlockRunner {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    output_format: OutputFormat,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UserConfig {
+    #[serde(default)]
+    code_blocks: BTreeMap<String, CodeBlockRunner>,
+}
+
+#[derive(Debug)]
+struct ExecutionConfig {
+    runners: BTreeMap<String, CodeBlockRunner>,
+}
+
+const DEFAULT_EXECUTION_CONFIG: &str = r#"
+[code_blocks.sh]
+command = "sh"
+args = ["-s"]
+
+[code_blocks.bash]
+command = "bash"
+args = ["-s"]
+
+[code_blocks.python]
+command = "uv"
+args = ["run", "-"]
+
+[code_blocks.py]
+command = "uv"
+args = ["run", "-"]
+
+[code_blocks.codex]
+command = "codex"
+args = ["exec", "--json", "-"]
+output_format = "codex"
+
+[code_blocks.js]
+command = "node"
+args = ["-"]
+
+[code_blocks.javascript]
+command = "node"
+args = ["-"]
+
+[code_blocks.node]
+command = "node"
+args = ["-"]
+"#;
+
+impl ExecutionConfig {
+    fn load() -> Result<Self> {
+        let defaults: UserConfig = toml::from_str(DEFAULT_EXECUTION_CONFIG)
+            .context("parsing built-in execution configuration")?;
+        let mut runners = defaults.code_blocks;
+
+        let Some(home) = std::env::var_os("HOME") else {
+            return Ok(Self { runners });
+        };
+        let path = Path::new(&home).join(".haystack.toml");
+        if !path.exists() {
+            return Ok(Self { runners });
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let user: UserConfig = toml::from_str(&contents)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        for (language, runner) in user.code_blocks {
+            if language.trim().is_empty() || runner.command.trim().is_empty() {
+                return Err(anyhow!(
+                    "{} contains an empty code block type or command",
+                    path.display()
+                ));
+            }
+            runners.insert(language.to_ascii_lowercase(), runner);
+        }
+        Ok(Self { runners })
+    }
+
+    fn runner(&self, language: &str) -> Option<&CodeBlockRunner> {
+        self.runners.get(&language.to_ascii_lowercase())
+    }
+
+    fn languages(&self) -> Vec<String> {
+        self.runners.keys().cloned().collect()
+    }
+}
+
+fn parse_fence_info(info: &str) -> (String, BTreeMap<String, String>) {
+    let mut parts = info.split_whitespace();
+    let language = parts.next().unwrap_or("").to_string();
+    let mut settings = BTreeMap::new();
+    for part in parts {
+        if let Some((key, value)) = part.split_once('=') {
+            settings.insert(key.to_string(), value.trim_matches(['"', '\'']).to_string());
+        } else {
+            settings.insert(part.to_string(), "true".to_string());
+        }
+    }
+    (language, settings)
+}
+
+fn markdown_code_block(input: &str, wanted_id: &str) -> Option<MarkdownCodeBlock> {
+    let wanted = wanted_id.strip_prefix("code-")?.parse::<usize>().ok()?;
+    let parser = MdParser::new_ext(input, Options::all());
+    let mut index = 0usize;
+    let mut current: Option<(String, String)> = None;
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                index += 1;
+                let info = match kind {
+                    CodeBlockKind::Fenced(info) => info.to_string(),
+                    CodeBlockKind::Indented => String::new(),
+                };
+                current = Some((info, String::new()));
+            }
+            Event::Text(text) if current.is_some() => {
+                current.as_mut().unwrap().1.push_str(&text);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if index == wanted {
+                    let (info, code) = current.take()?;
+                    let (language, settings) = parse_fence_info(&info);
+                    return Some(MarkdownCodeBlock { language, code, settings });
+                }
+                current = None;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn handle_run_request(request: Request, url: &str, src_dir: &Path, allow_exec: bool, execution: &ExecutionConfig) {
+    if !allow_exec {
+        let _ = request.respond(Response::from_string("Code execution is disabled").with_status_code(403));
+        return;
+    }
+    if request.method() != &Method::Post {
+        let _ = request.respond(Response::from_string("Method Not Allowed").with_status_code(405));
+        return;
+    }
+    let requested_by_page = request.headers().iter().any(|header| {
+        header.field.equiv("X-Haystack-Run") && header.value.as_str() == "1"
+    });
+    if !requested_by_page {
+        let _ = request.respond(Response::from_string("Missing execution request header").with_status_code(403));
+        return;
+    }
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let params: BTreeMap<String, String> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter_map(|(key, value)| {
+            Some((
+                urlencoding::decode(key).ok()?.into_owned(),
+                urlencoding::decode(value).ok()?.into_owned(),
+            ))
+        })
+        .collect();
+    let Some(source) = params.get("source") else {
+        let _ = request.respond(Response::from_string("Missing source").with_status_code(400));
+        return;
+    };
+    let Some(block_id) = params.get("id") else {
+        let _ = request.respond(Response::from_string("Missing id").with_status_code(400));
+        return;
+    };
+    if source.split('/').any(|part| part.is_empty() || part == ".." || part.contains('\\'))
+        || !source.ends_with(".md")
+    {
+        let _ = request.respond(Response::from_string("Invalid source").with_status_code(400));
+        return;
+    }
+    let source_path = src_dir.join(source);
+    let canonical_root = match src_dir.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = request.respond(Response::from_string(error.to_string()).with_status_code(500));
+            return;
+        }
+    };
+    let canonical_source = match source_path.canonicalize() {
+        Ok(path) if path.starts_with(&canonical_root) => path,
+        _ => {
+            let _ = request.respond(Response::from_string("Source not found").with_status_code(404));
+            return;
+        }
+    };
+    let input = match fs::read_to_string(&canonical_source) {
+        Ok(input) => input,
+        Err(error) => {
+            let _ = request.respond(Response::from_string(error.to_string()).with_status_code(500));
+            return;
+        }
+    };
+    let Some(block) = markdown_code_block(&input, block_id) else {
+        let _ = request.respond(Response::from_string("Code block not found").with_status_code(404));
+        return;
+    };
+    let Some(runner) = execution.runner(&block.language) else {
+        let _ = request.respond(Response::from_string("Unsupported code block language").with_status_code(400));
+        return;
+    };
+    let code_argument = runner.args.iter().any(|arg| arg.contains("{code}"));
+    let source_dir = canonical_source.parent().unwrap_or(&canonical_root);
+    let working_dir = if let Some(relative) = block.settings.get("cwd") {
+        match source_dir.join(relative).canonicalize() {
+            Ok(path) if path.starts_with(&canonical_root) && path.is_dir() => path,
+            _ => {
+                let _ = request.respond(Response::from_string("Invalid cwd setting").with_status_code(400));
+                return;
+            }
+        }
+    } else {
+        source_dir.to_path_buf()
+    };
+    let mut command = Command::new(&runner.command);
+    command
+        .args(runner.args.iter().map(|arg| arg.replace("{code}", &block.code)))
+        .current_dir(working_dir)
+        .stdin(if code_argument { Stdio::null() } else { Stdio::piped() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in &block.settings {
+        if let Some(name) = key.strip_prefix("env.") {
+            if !name.is_empty() {
+                command.env(name, value);
+            }
+        }
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = request.respond(Response::from_string(format!("Failed to start {}: {error}", runner.command)).with_status_code(500));
+            return;
+        }
+    };
+    if !code_argument {
+        let mut stdin = child.stdin.take().unwrap();
+        if let Err(error) = stdin.write_all(block.code.as_bytes()) {
+            let _ = child.kill();
+            let _ = request.respond(Response::from_string(format!("Failed to send code: {error}")).with_status_code(500));
+            return;
+        }
+    }
+    let stdout = child.stdout.take().unwrap();
+    // Merge stderr into the response without buffering by forwarding it through a pipe is
+    // not portable in std; runtimes used here generally report script errors on stderr.
+    // A small forwarding thread keeps both streams live while the HTTP body is streamed.
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<OutputChunk>();
+    let tx_out = tx.clone();
+    std::thread::spawn(move || {
+        let mut output = stdout;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = output.read(&mut buf) {
+            if n == 0 { break; }
+            if tx_out.send(OutputChunk::Stdout(buf[..n].to_vec())).is_err() { break; }
+        }
+    });
+    std::thread::spawn(move || {
+        let mut output = stderr;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = output.read(&mut buf) {
+            if n == 0 { break; }
+            if tx.send(OutputChunk::Stderr(buf[..n].to_vec())).is_err() { break; }
+        }
+    });
+        let reader = ChannelExecutionOutput { child, receiver: rx, pending: Vec::new() };
+    match runner.output_format {
+        OutputFormat::Text => {
+            let response = Response::new(
+                StatusCode(200),
+                vec![Header::from_bytes(&b"Content-Type"[..], &b"text/plain; charset=utf-8"[..]).unwrap()],
+                reader,
+                None,
+                None,
+            );
+            let _ = request.respond(response);
+        }
+        OutputFormat::Markdown => {
+            let mut output = String::new();
+            let mut reader = reader;
+            match reader.read_to_string(&mut output) {
+                Ok(_) => {
+                    let response = Response::from_string(render_markdown_fragment(&output))
+                        .with_status_code(200)
+                        .with_header(Header::from_bytes(
+                            &b"Content-Type"[..],
+                            &b"text/html; charset=utf-8"[..],
+                        ).unwrap());
+                    let _ = request.respond(response);
+                }
+                Err(error) => {
+                    let _ = request.respond(
+                        Response::from_string(format!("Failed to read command output: {error}"))
+                            .with_status_code(500),
+                    );
+                }
+            }
+        }
+        OutputFormat::Codex => {
+            let (stdout, stderr) = reader.collect_separated();
+            let response = match render_codex_output(&stdout, &stderr) {
+                Ok(html) => Response::from_string(html).with_status_code(200),
+                Err(error) => Response::from_string(error.to_string()).with_status_code(500),
+            }
+            .with_header(Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/html; charset=utf-8"[..],
+            ).unwrap());
+            let _ = request.respond(response);
+        }
+    }
+}
+
+enum OutputChunk {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+struct ChannelExecutionOutput {
+    child: std::process::Child,
+    receiver: std::sync::mpsc::Receiver<OutputChunk>,
+    pending: Vec<u8>,
+}
+
+impl ChannelExecutionOutput {
+    fn collect_separated(mut self) -> (Vec<u8>, Vec<u8>) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        while let Ok(chunk) = self.receiver.recv() {
+            match chunk {
+                OutputChunk::Stdout(bytes) => stdout.extend(bytes),
+                OutputChunk::Stderr(bytes) => stderr.extend(bytes),
+            }
+        }
+        let _ = self.child.wait();
+        (stdout, stderr)
+    }
+}
+
+impl Drop for ChannelExecutionOutput {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Read for ChannelExecutionOutput {
+    fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+        while self.pending.is_empty() {
+            match self.receiver.recv() {
+                Ok(OutputChunk::Stdout(bytes)) | Ok(OutputChunk::Stderr(bytes)) => {
+                    self.pending = bytes
+                }
+                Err(_) => {
+                    let _ = self.child.wait();
+                    return Ok(0);
+                }
+            }
+        }
+        let count = target.len().min(self.pending.len());
+        target[..count].copy_from_slice(&self.pending[..count]);
+        self.pending.drain(..count);
+        Ok(count)
+    }
+}
+
+fn executable_code_html(highlighted: &str, source: &str, block_id: &str, info: &str) -> String {
+    format!(
+        r#"<div class="executable-code" data-source="{}" data-block-id="{}"><div class="code-actions"><span>{}</span><button type="button" class="run-code">Run</button></div>{}<div class="code-output text-output" hidden aria-live="polite"></div></div>"#,
+        escape_attr(source),
+        escape_attr(block_id),
+        escape_html(info),
+        highlighted,
+    )
+}
+
 // removed legacy convert_file (replaced by convert_file_with_lang)
 
 fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx) -> Result<String> {
@@ -353,23 +785,45 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
     let mut events = Vec::new();
     let mut in_code = false;
     let mut code_lang: Option<String> = None;
+    let mut code_info = String::new();
     let mut code_buf = String::new();
+    let mut code_index = 0usize;
     for ev in parser {
         match ev {
             Event::Start(Tag::CodeBlock(kind)) => {
                 in_code = true;
+                code_index += 1;
                 code_buf.clear();
                 code_lang = match kind {
                     CodeBlockKind::Fenced(info) => {
+                        code_info = info.to_string();
                         let first = info.split_whitespace().next().unwrap_or("");
                         if first.is_empty() { None } else { Some(first.to_string()) }
                     }
-                    CodeBlockKind::Indented => None,
+                    CodeBlockKind::Indented => {
+                        code_info.clear();
+                        None
+                    }
                 };
             }
             Event::Text(t) if in_code => { code_buf.push_str(&t); }
             Event::End(TagEnd::CodeBlock) => {
-                let html_snippet = highlight_code(&code_buf, code_lang.as_deref());
+                let mut html_snippet = highlight_code(&code_buf, code_lang.as_deref());
+                if let (Some(source), Some(lang)) =
+                    (ctx.and_then(|c| c.exec_source.as_deref()), code_lang.as_deref())
+                {
+                    let is_configured = ctx
+                        .map(|c| c.exec_languages.iter().any(|configured| configured.eq_ignore_ascii_case(lang)))
+                        .unwrap_or(false);
+                    if is_configured {
+                        html_snippet = executable_code_html(
+                            &html_snippet,
+                            source,
+                            &format!("code-{}", code_index),
+                            &code_info,
+                        );
+                    }
+                }
                 events.push(Event::Html(CowStr::from(html_snippet)));
                 in_code = false; code_lang = None;
             }
@@ -384,6 +838,145 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
     }}}
     let title = extract_title_from_markdown(input);
     wrap_html_page_with_ctx(body, title, theme, ctx)
+}
+
+fn render_markdown_fragment(input: &str) -> String {
+    let parser = MdParser::new_ext(input, Options::all());
+    let mut events = Vec::new();
+    let mut in_code = false;
+    let mut code_lang: Option<String> = None;
+    let mut code_buf = String::new();
+    for event in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                in_code = true;
+                code_buf.clear();
+                code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => {
+                        let language = info.split_whitespace().next().unwrap_or("");
+                        if language.is_empty() { None } else { Some(language.to_string()) }
+                    }
+                    CodeBlockKind::Indented => None,
+                };
+            }
+            Event::Text(text) if in_code => code_buf.push_str(&text),
+            Event::End(TagEnd::CodeBlock) => {
+                events.push(Event::Html(CowStr::from(highlight_code(
+                    &code_buf,
+                    code_lang.as_deref(),
+                ))));
+                in_code = false;
+                code_lang = None;
+            }
+            Event::Html(raw) | Event::InlineHtml(raw) if !in_code => {
+                events.push(Event::Text(raw));
+            }
+            other if !in_code => events.push(other),
+            _ => {}
+        }
+    }
+    let mut fragment = String::new();
+    html::push_html(&mut fragment, events.into_iter());
+    fragment
+}
+
+fn render_codex_output(stdout: &[u8], stderr: &[u8]) -> Result<String> {
+    let output = std::str::from_utf8(stdout).context("Codex returned non-UTF-8 JSONL")?;
+    let mut rendered = String::from(r#"<div class="codex-output">"#);
+    let mut event_count = 0usize;
+
+    for (index, line) in output.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("parsing Codex JSONL event on line {}", index + 1))?;
+        let event_type = event.get("type").and_then(|value| value.as_str()).unwrap_or("");
+        match event_type {
+            "item.completed" => {
+                let item = &event["item"];
+                match item.get("type").and_then(|value| value.as_str()).unwrap_or("") {
+                    "agent_message" => {
+                        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                            rendered.push_str(r#"<section class="codex-message">"#);
+                            rendered.push_str(&render_markdown_fragment(text));
+                            rendered.push_str("</section>");
+                            event_count += 1;
+                        }
+                    }
+                    "command_execution" => {
+                        let command = item.get("command").and_then(|value| value.as_str()).unwrap_or("");
+                        let status = item.get("status").and_then(|value| value.as_str()).unwrap_or("completed");
+                        let command_output = item
+                            .get("aggregated_output")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        rendered.push_str(&format!(
+                            r#"<details class="codex-command codex-status-{}"><summary><code>{}</code> <span>{}</span></summary>"#,
+                            escape_attr(status),
+                            escape_html(command),
+                            escape_html(status),
+                        ));
+                        if !command_output.is_empty() {
+                            rendered.push_str(&format!("<pre>{}</pre>", escape_html(command_output)));
+                        }
+                        rendered.push_str("</details>");
+                        event_count += 1;
+                    }
+                    "error" => {
+                        let message = item.get("message").and_then(|value| value.as_str()).unwrap_or("Unknown Codex error");
+                        rendered.push_str(&format!(
+                            r#"<div class="codex-error">{}</div>"#,
+                            escape_html(message),
+                        ));
+                        event_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            "turn.failed" | "error" => {
+                let message = event
+                    .pointer("/error/message")
+                    .or_else(|| event.get("message"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Codex execution failed");
+                rendered.push_str(&format!(
+                    r#"<div class="codex-error">{}</div>"#,
+                    escape_html(message),
+                ));
+                event_count += 1;
+            }
+            "turn.completed" => {
+                if let Some(usage) = event.get("usage") {
+                    let input = usage.get("input_tokens").and_then(|value| value.as_u64()).unwrap_or(0);
+                    let cached = usage
+                        .get("cached_input_tokens")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let uncached = input.saturating_sub(cached);
+                    let output = usage.get("output_tokens").and_then(|value| value.as_u64()).unwrap_or(0);
+                    rendered.push_str(&format!(
+                        r#"<footer class="codex-usage">{} uncached input · {} cached input · {} output tokens</footer>"#,
+                        uncached, cached, output,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let stderr = String::from_utf8_lossy(stderr);
+    if !stderr.trim().is_empty() {
+        rendered.push_str(&format!(
+            r#"<details class="codex-stderr"><summary>Codex diagnostics</summary><pre>{}</pre></details>"#,
+            escape_html(stderr.trim()),
+        ));
+    }
+    if event_count == 0 {
+        return Err(anyhow!("Codex returned no renderable events"));
+    }
+    rendered.push_str("</div>");
+    Ok(rendered)
 }
 
 // removed legacy convert_org_to_html (replaced by convert_org_to_html_with_ctx)
@@ -516,6 +1109,8 @@ struct PageLangCtx {
     supported_langs: Vec<String>,
     page_tail_html: Option<String>,
     available_langs: Vec<String>,
+    exec_source: Option<String>,
+    exec_languages: Vec<String>,
 }
 
 fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> String {
@@ -547,15 +1142,26 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
       },
       options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
     };
-    // Only load MathJax if the page likely contains math
-    var maybeHasMath = /\\$[^\\$]+\\$|\\\\\(|\\\\\)|\\\\\[|\\\\\]|\\$\\$/m.test(document.body ? document.body.innerHTML : '');
-    if (maybeHasMath && !document.getElementById('MathJax-script')) {
+    window.haystackTypesetMath = function(root) {
+      var content = root ? (root.textContent || '') : '';
+      var maybeHasMath = /\\$[^\\$]+\\$|\\\\\(|\\\\\)|\\\\\[|\\\\\]|\\$\\$/m.test(content);
+      if (!maybeHasMath) return;
+      if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
+        window.MathJax.typesetPromise(root ? [root] : undefined).catch(function(error){
+          console.error('MathJax typesetting failed', error);
+        });
+        return;
+      }
+      if (document.getElementById('MathJax-script')) return;
       var mj = document.createElement('script');
       mj.id = 'MathJax-script';
       mj.async = true;
       mj.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js';
       document.head.appendChild(mj);
-    }
+    };
+    document.addEventListener('DOMContentLoaded', function(){
+      window.haystackTypesetMath(document.body);
+    });
   } catch(e) {}
 })();"#;
     let share_script = r#"(function(){
@@ -704,9 +1310,54 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
     window.location.href = url;
   });
 })();"#;
+    let execution_script = r#"(function(){
+  document.addEventListener('click', async function(event){
+    var button = event.target.closest('.run-code');
+    if(!button) return;
+    var box = button.closest('.executable-code');
+    var output = box.querySelector('.code-output');
+    var source = box.getAttribute('data-source');
+    var id = box.getAttribute('data-block-id');
+    button.disabled = true;
+    button.textContent = 'Running…';
+    output.hidden = false;
+    output.textContent = '';
+    output.classList.remove('markdown-output');
+    output.classList.add('text-output');
+    try {
+      var url = '/__haystack/run?source=' + encodeURIComponent(source) + '&id=' + encodeURIComponent(id);
+      var response = await fetch(url, {
+        method: 'POST',
+        headers: {'X-Haystack-Run': '1'}
+      });
+      if(!response.ok) throw new Error((await response.text()) || ('HTTP ' + response.status));
+      if((response.headers.get('content-type') || '').indexOf('text/html') !== -1) {
+        output.classList.remove('text-output');
+        output.classList.add('markdown-output');
+        output.innerHTML = await response.text();
+        if(window.haystackTypesetMath) window.haystackTypesetMath(output);
+        return;
+      }
+      if(!response.body) { output.textContent = await response.text(); return; }
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      while(true) {
+        var chunk = await reader.read();
+        if(chunk.done) break;
+        output.textContent += decoder.decode(chunk.value, {stream:true});
+      }
+      output.textContent += decoder.decode();
+    } catch(error) {
+      output.textContent += 'Error: ' + (error.message || error);
+    } finally {
+      button.disabled = false;
+      button.textContent = 'Run';
+    }
+  });
+})();"#;
     format!(
-        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"auto\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
-        escape_attr(&html_lang), page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script, lang_switch_script
+        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"auto\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
+        escape_attr(&html_lang), page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script, lang_switch_script, execution_script
     )
 }
 
@@ -728,7 +1379,7 @@ fn collect_docs_under(root: &Path, _ignore: Option<()>, exclude_first_level: &Ve
         let p = entry.path();
         if p.is_file() {
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                if ext == "md" || ext == "org" {
+                if ext == "md" || ext == "org" || ext == "html" {
                     if let Ok(rel) = p.strip_prefix(root) {
                         // Exclude top-level language directories when scanning default root
                         if let Some(first) = rel.iter().next().and_then(|s| s.to_str()) {
@@ -775,6 +1426,8 @@ fn build_page_ctx(base_src: &Path, rel_root: &Path, rel_file: &Path, cfg: &LangC
         supported_langs: cfg.all_langs(),
         page_tail_html: Some(tail_html),
         available_langs: available,
+        exec_source: None,
+        exec_languages: Vec::new(),
     }
 }
 
@@ -788,6 +1441,8 @@ fn build_runtime_page_ctx(src_dir: &Path, current_lang: &Option<String>, base_ta
         supported_langs: cfg.all_langs(),
         page_tail_html: Some(tail_html),
         available_langs: available,
+        exec_source: None,
+        exec_languages: Vec::new(),
     })
 }
 
@@ -1062,6 +1717,46 @@ pre {
   background: var(--code-bg);
   padding: 0.9rem; border-radius: 6px; overflow: auto; border: 1px solid var(--border);
 }
+.executable-code { margin: 1em 0; }
+.executable-code > pre { margin-top: 0; }
+.code-actions {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.35rem 0.55rem; border: 1px solid var(--border); border-bottom: 0;
+  border-radius: 6px 6px 0 0; background: var(--code-bg);
+  color: var(--muted); font: 0.8rem ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.code-actions + pre { border-radius: 0 0 6px 6px; }
+.run-code {
+  border: 1px solid var(--border); border-radius: 4px; padding: 0.2rem 0.65rem;
+  background: var(--bg); color: var(--fg); cursor: pointer; font: inherit;
+}
+.run-code:disabled { opacity: 0.6; cursor: wait; }
+.code-output {
+  min-height: 1.5em; color: var(--fg); background: var(--code-bg);
+  padding: 0.9rem; border: 1px dashed var(--border);
+  border-style: dashed; border-radius: 6px !important;
+}
+.code-output.text-output {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.95em;
+}
+.code-output.markdown-output { white-space: normal; }
+.code-output.markdown-output > :first-child { margin-top: 0; }
+.code-output.markdown-output > :last-child { margin-bottom: 0; }
+.codex-output > :first-child { margin-top: 0; }
+.codex-output > :last-child { margin-bottom: 0; }
+.codex-message + .codex-message { border-top: 1px solid var(--border); margin-top: 1rem; }
+.codex-command { margin: 0.75rem 0; font-size: 0.9em; }
+.codex-command summary { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.codex-command summary span, .codex-usage { color: var(--muted); }
+.codex-command pre, .codex-stderr pre { margin-bottom: 0; }
+.codex-error {
+  margin: 0.75rem 0; padding: 0.6rem 0.8rem; border-left: 3px solid #b94a48;
+  background: color-mix(in srgb, #b94a48 12%, var(--code-bg));
+}
+.codex-usage { margin-top: 1rem; font-size: 0.8rem; }
+.codex-stderr { margin-top: 1rem; }
  code { background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 4px; }
  pre code { padding: 0; background: transparent; }
  table { width: 100%; border-collapse: collapse; margin: 1.2rem 0; }
@@ -1270,4 +1965,103 @@ fn highlight_code_blocks_in_html(input_html: &str) -> String {
     });
 
     tmp.into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_code_block_language_code_and_settings_by_id() {
+        let markdown = "```text\nskip\n```\n\n```python cwd=examples env.MODE=test flag\nprint('ok')\n```\n";
+        let block = markdown_code_block(markdown, "code-2").unwrap();
+
+        assert_eq!(block.language, "python");
+        assert_eq!(block.code, "print('ok')\n");
+        assert_eq!(block.settings.get("cwd").map(String::as_str), Some("examples"));
+        assert_eq!(block.settings.get("env.MODE").map(String::as_str), Some("test"));
+        assert_eq!(block.settings.get("flag").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn rejects_malformed_block_ids() {
+        assert!(markdown_code_block("```sh\ntrue\n```", "../code-1").is_none());
+        assert!(markdown_code_block("```sh\ntrue\n```", "code-zero").is_none());
+    }
+
+    #[test]
+    fn parses_configured_codex_runner() {
+        let config: UserConfig = toml::from_str(
+            "[code_blocks.codex]\ncommand = \"codex\"\nargs = [\"exec\", \"--json\", \"-\"]\noutput_format = \"codex\"\n",
+        ).unwrap();
+        let runner = config.code_blocks.get("codex").unwrap();
+
+        assert_eq!(runner.command, "codex");
+        assert_eq!(runner.args, ["exec", "--json", "-"]);
+        assert!(!runner.args.iter().any(|arg| arg.contains("{code}")));
+        assert!(matches!(runner.output_format, OutputFormat::Codex));
+    }
+
+    #[test]
+    fn built_in_runners_are_default_toml_configuration() {
+        let config: UserConfig = toml::from_str(DEFAULT_EXECUTION_CONFIG).unwrap();
+
+        assert_eq!(config.code_blocks.len(), 8);
+        assert_eq!(config.code_blocks["sh"].command, "sh");
+        assert_eq!(config.code_blocks["python"].command, "uv");
+        assert_eq!(config.code_blocks["python"].args, ["run", "-"]);
+        assert_eq!(config.code_blocks["py"].command, "uv");
+        assert_eq!(config.code_blocks["py"].args, ["run", "-"]);
+        assert_eq!(config.code_blocks["codex"].args, ["exec", "--json", "-"]);
+        assert!(matches!(
+            config.code_blocks["codex"].output_format,
+            OutputFormat::Codex
+        ));
+        assert_eq!(config.code_blocks["javascript"].command, "node");
+    }
+
+    #[test]
+    fn renders_run_button_only_when_execution_context_is_present() {
+        let theme = ThemeConfig::default();
+        let enabled = PageLangCtx {
+            exec_source: Some("guide.md".to_string()),
+            exec_languages: vec!["python".to_string()],
+            ..PageLangCtx::default()
+        };
+        let with_execution =
+            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, Some(&enabled));
+        let without_execution =
+            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, None);
+
+        assert!(with_execution.contains(r#"data-block-id="code-1""#));
+        assert!(with_execution.contains(r#"class="run-code""#));
+        assert!(with_execution.contains("haystackTypesetMath(output)"));
+        assert!(!without_execution.contains(r#"class="run-code""#));
+    }
+
+    #[test]
+    fn renders_markdown_output_as_html_fragment() {
+        let fragment = render_markdown_fragment("# Result\n\n- one\n- two\n\n<img src=x onerror=alert(1)>");
+
+        assert!(fragment.contains("<h1>Result</h1>"));
+        assert!(fragment.contains("<li>one</li>"));
+        assert!(fragment.contains("&lt;img"));
+        assert!(!fragment.contains("<html"));
+    }
+
+    #[test]
+    fn renders_codex_jsonl_events() {
+        let jsonl = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"thread_1\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"command_execution\",\"command\":\"cargo test\",\"aggregated_output\":\"ok\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_2\",\"type\":\"agent_message\",\"text\":\"## Done\\n\\nTests pass.\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":75,\"output_tokens\":20}}\n",
+        );
+        let html = render_codex_output(jsonl.as_bytes(), b"diagnostic").unwrap();
+
+        assert!(html.contains("<code>cargo test</code>"));
+        assert!(html.contains("<h2>Done</h2>"));
+        assert!(html.contains("25 uncached input · 75 cached input · 20 output tokens"));
+        assert!(html.contains("Codex diagnostics"));
+    }
 }
