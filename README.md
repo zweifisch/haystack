@@ -34,28 +34,32 @@ haystack build [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES
 
 - Scans `src/` for `*.md` and `*.org` (recursively).
 - Writes corresponding `*.html` into `output/`, preserving subdirectories.
-- Writes `output/static-files.txt` with one prefixed static asset reference per line.
+- Writes `static-files.txt` with tab-separated `source`, hashed object `key`,
+  and content `hash` columns for prefixed asset references.
 - With `--index`, also writes `output/index.html` with links to all Markdown/Org files.
  - Multi-language (optional):
    - Provide `--langs en,zh,fr` (first is default, unprefixed).
    - Default language lives in `src/`; others in `src/<lang>/`.
    - Output mirrors this: `output/` (default) and `output/<lang>/` for others.
-- With `--asset-prefix`, root-relative asset URLs in rendered Markdown/Org and copied
-  HTML are rewritten to the prefix. Page links such as `/post.html` are left unchanged.
-  This is useful when large assets are ignored in git and uploaded separately:
-
-```sh
-aws s3 sync ./src/audio s3://my-bucket/audio \
-  --endpoint-url https://<ACCOUNT_ID>.r2.cloudflarestorage.com
-haystack build --asset-prefix https://assets.example.com
-```
-
-Or upload exactly the referenced prefixed assets with Wrangler:
+- With `--asset-prefix`, root-relative and relative asset URLs in rendered Markdown/Org
+  and copied HTML are rewritten to content-hashed keys under the prefix. Page links
+  such as `/post.html` are left unchanged. This is useful when large assets are
+  ignored in git and uploaded separately:
 
 ```sh
 haystack build --asset-prefix https://assets.example.com
 scripts/upload-static-files-to-r2.sh --remote my-bucket
 ```
+
+For CI builds where ignored assets are unavailable, commit a generated manifest
+and pass it back as the static file list:
+
+```sh
+haystack build --asset-prefix https://assets.example.com --static-file-list static-assets.txt
+```
+
+If a referenced asset is missing locally and has no manifest entry, Haystack
+prints a warning and leaves that URL unchanged.
 
 ### Serve on-demand HTML from `src/`:
 

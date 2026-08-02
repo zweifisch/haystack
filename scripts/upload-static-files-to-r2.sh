@@ -11,16 +11,17 @@ Options:
 
 Arguments:
   BUCKET      Cloudflare R2 bucket name.
-  MANIFEST    Newline-delimited static file list. Default: output/static-files.txt
+  MANIFEST    Newline-delimited static file list. Default: static-files.txt
   SOURCE_DIR  Directory containing source assets. Default: src
 
 Example:
   scripts/upload-static-files-to-r2.sh --remote haystack-assets
-  scripts/upload-static-files-to-r2.sh haystack-assets output/static-files.txt src
+  scripts/upload-static-files-to-r2.sh haystack-assets static-files.txt src
 
 Each manifest line is used as both:
-  - the R2 object key
-  - the path under SOURCE_DIR
+  - source path under SOURCE_DIR
+  - R2 object key
+  - content hash
 EOF
 }
 
@@ -36,7 +37,7 @@ if [ "${1:-}" = "--remote" ]; then
 fi
 
 bucket="${1:-}"
-manifest="${2:-output/static-files.txt}"
+manifest="${2:-static-files.txt}"
 source_dir="${3:-src}"
 
 if [ -z "$bucket" ]; then
@@ -62,17 +63,29 @@ fi
 uploaded=0
 missing=0
 
-while IFS= read -r key || [ -n "$key" ]; do
-  case "$key" in
+while IFS='	' read -r source key hash || [ -n "${source:-}" ]; do
+  case "${source:-}" in
     ""|\#*) continue ;;
     /*|*..*)
-      echo "skip unsafe manifest path: $key" >&2
+      echo "skip unsafe manifest source: $source" >&2
       missing=$((missing + 1))
       continue
       ;;
   esac
+  case "${key:-}" in
+    ""|/*|*..*)
+      echo "skip unsafe manifest key for $source: ${key:-}" >&2
+      missing=$((missing + 1))
+      continue
+      ;;
+  esac
+  if [ -z "${hash:-}" ]; then
+    echo "skip manifest row without hash: $source" >&2
+    missing=$((missing + 1))
+    continue
+  fi
 
-  file="$source_dir/$key"
+  file="$source_dir/$source"
   if [ ! -f "$file" ]; then
     echo "missing: $file" >&2
     missing=$((missing + 1))

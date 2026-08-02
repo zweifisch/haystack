@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,7 +48,7 @@ enum Commands {
         #[arg(long, value_name = "URL")]
         asset_prefix: Option<String>,
         /// Write a newline-delimited list of copied static files
-        #[arg(long, value_name = "PATH", default_value = "output/static-files.txt")]
+        #[arg(long, value_name = "PATH", default_value = "static-files.txt")]
         static_file_list: PathBuf,
     },
     /// Serve on-demand HTML from src/*.md and src/*.org
@@ -126,15 +126,31 @@ impl LangConfig {
 #[derive(Debug, Clone, Default)]
 struct AssetConfig {
     prefix: Option<String>,
+    source_dir: PathBuf,
+    manifest: BTreeMap<String, StaticAsset>,
+    generated: BTreeMap<String, StaticAsset>,
 }
 
 impl AssetConfig {
-    fn new(prefix: Option<String>) -> Self {
+    fn new(prefix: Option<String>, source_dir: &Path, manifest_path: &Path) -> Result<Self> {
         let prefix = prefix
             .map(|value| value.trim().trim_end_matches('/').to_string())
             .filter(|value| !value.is_empty());
-        Self { prefix }
+        let manifest = read_static_file_list(manifest_path)?;
+        Ok(Self {
+            prefix,
+            source_dir: source_dir.to_path_buf(),
+            manifest,
+            generated: BTreeMap::new(),
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaticAsset {
+    source: String,
+    key: String,
+    hash: String,
 }
 
 fn main() -> Result<()> {
@@ -146,16 +162,16 @@ fn main() -> Result<()> {
             let out = Path::new("output");
             let theme = ThemeConfig { light: theme_light, dark: theme_dark };
             let lang = LangConfig::new(langs);
-            let assets = AssetConfig::new(asset_prefix);
-            build_all(src, out, &theme, &lang, index, &assets, &static_file_list)?;
+            let mut assets = AssetConfig::new(asset_prefix, src, &static_file_list)?;
+            build_all(src, out, &theme, &lang, index, &mut assets, &static_file_list)?;
         }
         Commands::Serve { port, theme_light, theme_dark, langs, allow_exec, asset_prefix } => {
             let src = Path::new("src");
             let theme = ThemeConfig { light: theme_light, dark: theme_dark };
             let lang = LangConfig::new(langs);
-            let assets = AssetConfig::new(asset_prefix);
+            let mut assets = AssetConfig::new(asset_prefix, src, Path::new("static-files.txt"))?;
             let execution = ExecutionConfig::load()?;
-            serve(port, src, &theme, &lang, allow_exec, &execution, &assets)?;
+            serve(port, src, &theme, &lang, allow_exec, &execution, &mut assets)?;
         }
         Commands::Themes => {
             list_themes();
@@ -165,13 +181,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangConfig, generate_index: bool, assets: &AssetConfig, static_file_list: &Path) -> Result<()> {
+fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangConfig, generate_index: bool, assets: &mut AssetConfig, static_file_list: &Path) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
     fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    let mut static_files = BTreeSet::new();
-
     // Helper to process a single language subtree
     fn process_lang(
         base_src: &Path,
@@ -181,8 +195,7 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
         href_prefix: &str,
         generate_index: bool,
         cfg: &LangConfig,
-        assets: &AssetConfig,
-        static_files: &mut BTreeSet<String>,
+        assets: &mut AssetConfig,
     ) -> Result<()> {
         let src_root = base_src.join(rel_root);
         let out_root = base_out.join(rel_root);
@@ -202,7 +215,7 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
                         if let Some(parent) = out_path.parent() { fs::create_dir_all(parent)?; }
 
                         // Build page with language switcher context
-                        let html = convert_file_with_lang(path, theme, &build_page_ctx(&base_src, &rel_root, rel, cfg), assets, Some(static_files))?;
+                        let html = convert_file_with_lang(path, theme, &build_page_ctx(&base_src, &rel_root, rel, cfg), assets)?;
                         fs::write(&out_path, html).with_context(|| format!("writing output file {}", out_path.display()))?;
                         println!("Built {} -> {}", path.display(), out_path.display());
                     }
@@ -217,7 +230,7 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
                                 .join(rel.parent().unwrap_or_else(|| Path::new("")))
                                 .to_string_lossy()
                                 .replace('\\', "/");
-                            fs::write(&out_path, rewrite_asset_urls_collect(&html, assets, &page_dir, static_files)).with_context(|| format!("writing html {}", out_path.display()))?;
+                            fs::write(&out_path, rewrite_asset_urls_collect(&html, assets, &page_dir)?).with_context(|| format!("writing html {}", out_path.display()))?;
                         } else {
                             fs::copy(path, &out_path).with_context(|| format!("copying html {} -> {}", path.display(), out_path.display()))?;
                         }
@@ -246,20 +259,20 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
     }
 
     // Build default (unprefixed) subtree: skip language folders for non-default languages
-    process_lang(src_dir, out_dir, theme, Path::new(""), "", generate_index, lang, assets, &mut static_files)?;
+    process_lang(src_dir, out_dir, theme, Path::new(""), "", generate_index, lang, assets)?;
 
     // Build each non-default language under its prefix if configured
     for lang_code in &lang.others {
         let rel_root = Path::new(lang_code);
         if src_dir.join(rel_root).exists() {
-            process_lang(src_dir, out_dir, theme, rel_root, &format!("{}/", lang_code), generate_index, lang, assets, &mut static_files)?;
+            process_lang(src_dir, out_dir, theme, rel_root, &format!("{}/", lang_code), generate_index, lang, assets)?;
         }
     }
-    write_static_file_list(static_file_list, &static_files)?;
+    write_static_file_list(static_file_list, &assets.generated)?;
     Ok(())
 }
 
-fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, allow_exec: bool, execution: &ExecutionConfig, assets: &AssetConfig) -> Result<()> {
+fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, allow_exec: bool, execution: &ExecutionConfig, assets: &mut AssetConfig) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
@@ -329,16 +342,19 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
 
             if html_path.exists() {
                 match fs::read_to_string(&html_path) {
-                    Ok(s) => {
+                    Ok(s) => match {
                         let page_dir = Path::new(path)
                             .parent()
                             .unwrap_or_else(|| Path::new(""))
                             .to_string_lossy()
                             .replace('\\', "/");
-                        Response::from_string(rewrite_asset_urls(&s, assets, &page_dir))
-                    }
-                        .with_status_code(200)
-                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+                        rewrite_asset_urls(&s, assets, &page_dir)
+                    } {
+                        Ok(html) => Response::from_string(html)
+                            .with_status_code(200)
+                            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+                        Err(error) => Response::from_string(error.to_string()).with_status_code(500),
+                    },
                     Err(e) => Response::from_string(format!("Error reading {}: {}", html_path.display(), e))
                         .with_status_code(500),
                 }
@@ -353,7 +369,7 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
                     ctx.exec_source = Some(source);
                     ctx.exec_languages = execution.languages();
                 }
-                match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html_with_ctx(&s, theme, ctx.as_ref(), assets, None)) {
+                match fs::read_to_string(&md_path).and_then(|s| convert_markdown_to_html_with_ctx(&s, theme, ctx.as_ref(), assets).map_err(|error| std::io::Error::other(error.to_string()))) {
                     Ok(html) => Response::from_string(html)
                         .with_status_code(200)
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
@@ -362,7 +378,7 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
                 }
             } else if org_path.exists() {
                 let ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg);
-                match fs::read_to_string(&org_path).map(|s| convert_org_to_html_with_ctx(&s, theme, ctx.as_ref(), assets, None)) {
+                match fs::read_to_string(&org_path).and_then(|s| convert_org_to_html_with_ctx(&s, theme, ctx.as_ref(), assets).map_err(|error| std::io::Error::other(error.to_string()))) {
                     Ok(html) => Response::from_string(html)
                         .with_status_code(200)
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
@@ -1047,7 +1063,7 @@ fn executable_code_html(highlighted: &str, source: &str, block_id: &str, info: &
 
 // removed legacy convert_file (replaced by convert_file_with_lang)
 
-fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx, assets: &AssetConfig, static_files: Option<&mut BTreeSet<String>>) -> Result<String> {
+fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx, assets: &mut AssetConfig) -> Result<String> {
     let mut file = fs::File::open(path)
         .with_context(|| format!("opening input file {}", path.display()))?;
     let mut buf = String::new();
@@ -1055,8 +1071,8 @@ fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx, a
         .with_context(|| format!("reading input file {}", path.display()))?;
 
     let html = match path.extension().and_then(|s| s.to_str()) {
-        Some("md") => convert_markdown_to_html_with_ctx(&buf, theme, Some(ctx), assets, static_files),
-        Some("org") => convert_org_to_html_with_ctx(&buf, theme, Some(ctx), assets, static_files),
+        Some("md") => convert_markdown_to_html_with_ctx(&buf, theme, Some(ctx), assets)?,
+        Some("org") => convert_org_to_html_with_ctx(&buf, theme, Some(ctx), assets)?,
         other => return Err(anyhow!("unsupported extension {:?} for {}", other, path.display())),
     };
     Ok(html)
@@ -1064,7 +1080,7 @@ fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx, a
 
 // removed legacy convert_markdown_to_html (replaced by convert_markdown_to_html_with_ctx)
 
-fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>, assets: &AssetConfig, static_files: Option<&mut BTreeSet<String>>) -> String {
+fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>, assets: &mut AssetConfig) -> Result<String> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
@@ -1156,9 +1172,9 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
         body = rewrite_internal_links(&body, &format!("/{}/", cur));
     }}}
     let page_dir = ctx.map(|c| c.page_dir.as_str()).unwrap_or("");
-    body = rewrite_asset_urls_maybe_collect(&body, assets, page_dir, static_files);
+    body = rewrite_asset_urls_maybe_collect(&body, assets, page_dir)?;
     let title = extract_title_from_markdown(input);
-    wrap_html_page_with_ctx(body, title, theme, ctx)
+    Ok(wrap_html_page_with_ctx(body, title, theme, ctx))
 }
 
 fn render_markdown_fragment(input: &str) -> String {
@@ -1307,7 +1323,7 @@ fn render_codex_output(stdout: &[u8], stderr: &[u8]) -> Result<String> {
 
 // removed legacy convert_org_to_html (replaced by convert_org_to_html_with_ctx)
 
-fn convert_org_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>, assets: &AssetConfig, static_files: Option<&mut BTreeSet<String>>) -> String {
+fn convert_org_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>, assets: &mut AssetConfig) -> Result<String> {
     let org = Org::parse(input);
     let mut bytes: Vec<u8> = Vec::new();
     let _ = org.write_html(&mut bytes);
@@ -1318,8 +1334,8 @@ fn convert_org_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Optio
         body = rewrite_internal_links(&body, &format!("/{}/", cur));
     }}}
     let page_dir = ctx.map(|c| c.page_dir.as_str()).unwrap_or("");
-    body = rewrite_asset_urls_maybe_collect(&body, assets, page_dir, static_files);
-    wrap_html_page_with_ctx(body, title, theme, ctx)
+    body = rewrite_asset_urls_maybe_collect(&body, assets, page_dir)?;
+    Ok(wrap_html_page_with_ctx(body, title, theme, ctx))
 }
 
 fn rewrite_internal_links(body_html: &str, prefix: &str) -> String {
@@ -1335,90 +1351,104 @@ fn rewrite_internal_links(body_html: &str, prefix: &str) -> String {
     tmp.into_owned()
 }
 
-fn rewrite_asset_urls(body_html: &str, assets: &AssetConfig, page_dir: &str) -> String {
-    rewrite_asset_urls_maybe_collect(body_html, assets, page_dir, None)
+fn rewrite_asset_urls(body_html: &str, assets: &mut AssetConfig, page_dir: &str) -> Result<String> {
+    rewrite_asset_urls_maybe_collect(body_html, assets, page_dir)
 }
 
-fn rewrite_asset_urls_collect(body_html: &str, assets: &AssetConfig, page_dir: &str, static_files: &mut BTreeSet<String>) -> String {
-    rewrite_asset_urls_maybe_collect(body_html, assets, page_dir, Some(static_files))
+fn rewrite_asset_urls_collect(body_html: &str, assets: &mut AssetConfig, page_dir: &str) -> Result<String> {
+    rewrite_asset_urls_maybe_collect(body_html, assets, page_dir)
 }
 
-fn rewrite_asset_urls_maybe_collect(body_html: &str, assets: &AssetConfig, page_dir: &str, mut static_files: Option<&mut BTreeSet<String>>) -> String {
+fn rewrite_asset_urls_maybe_collect(body_html: &str, assets: &mut AssetConfig, page_dir: &str) -> Result<String> {
     let Some(prefix) = assets.prefix.as_deref() else {
-        return body_html.to_string();
+        return Ok(body_html.to_string());
     };
+    let prefix = prefix.to_string();
 
     static SRCSET_ATTR_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r#"(?is)\b(srcset)=(["'])([^"']*)["']"#).unwrap());
     static URL_ATTR_RE: Lazy<Regex> =
         Lazy::new(|| Regex::new(r#"(?is)\b(src|poster|href)=(["'])([^"']*)["']"#).unwrap());
 
-    let with_srcset = SRCSET_ATTR_RE.replace_all(body_html, |caps: &regex::Captures| {
+    let mut rewritten = String::new();
+    let mut last = 0;
+    for caps in SRCSET_ATTR_RE.captures_iter(body_html) {
+        let matched = caps.get(0).unwrap();
+        rewritten.push_str(&body_html[last..matched.start()]);
         let attr = caps.get(1).map(|m| m.as_str()).unwrap_or("srcset");
         let quote = caps.get(2).map(|m| m.as_str()).unwrap_or("\"");
         let value = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-        format!("{attr}={quote}{}{quote}", rewrite_srcset(value, prefix, page_dir, static_files.as_deref_mut()))
-    });
+        rewritten.push_str(&format!("{attr}={quote}{}{quote}", rewrite_srcset(value, &prefix, page_dir, assets)?));
+        last = matched.end();
+    }
+    rewritten.push_str(&body_html[last..]);
 
-    URL_ATTR_RE.replace_all(&with_srcset, |caps: &regex::Captures| {
+    let with_srcset = rewritten;
+    let mut rewritten = String::new();
+    let mut last = 0;
+    for caps in URL_ATTR_RE.captures_iter(&with_srcset) {
+        let matched = caps.get(0).unwrap();
+        rewritten.push_str(&with_srcset[last..matched.start()]);
         let attr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let quote = caps.get(2).map(|m| m.as_str()).unwrap_or("\"");
         let value = caps.get(3).map(|m| m.as_str()).unwrap_or("");
-        let rewritten = rewrite_asset_url_value(attr, value, prefix, page_dir, static_files.as_deref_mut())
+        let rewritten_value = rewrite_asset_url_value(attr, value, &prefix, page_dir, assets)?
             .unwrap_or_else(|| value.to_string());
-        format!("{attr}={quote}{rewritten}{quote}")
-    }).into_owned()
-}
-
-fn rewrite_srcset(value: &str, prefix: &str, page_dir: &str, mut static_files: Option<&mut BTreeSet<String>>) -> String {
-    value
-        .split(',')
-        .map(|candidate| {
-            let leading = candidate.len() - candidate.trim_start().len();
-            let trimmed_start = &candidate[leading..];
-            let trailing = trimmed_start.len() - trimmed_start.trim_end().len();
-            let core = &trimmed_start[..trimmed_start.len() - trailing];
-            let mut parts = core.splitn(2, char::is_whitespace);
-            let url = parts.next().unwrap_or("");
-            let descriptor = parts.next().unwrap_or("");
-            let rewritten = prefix_asset_url(url, prefix, page_dir, static_files.as_deref_mut()).unwrap_or_else(|| url.to_string());
-            format!(
-                "{}{}{}{}{}",
-                &candidate[..leading],
-                rewritten,
-                if descriptor.is_empty() { "" } else { " " },
-                descriptor,
-                &trimmed_start[trimmed_start.len() - trailing..],
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn rewrite_asset_url_value(attr: &str, value: &str, prefix: &str, page_dir: &str, static_files: Option<&mut BTreeSet<String>>) -> Option<String> {
-    if attr.eq_ignore_ascii_case("href") && !is_asset_like_url(value) {
-        return None;
+        rewritten.push_str(&format!("{attr}={quote}{rewritten_value}{quote}"));
+        last = matched.end();
     }
-    prefix_asset_url(value, prefix, page_dir, static_files)
+    rewritten.push_str(&with_srcset[last..]);
+    Ok(rewritten)
 }
 
-fn prefix_asset_url(value: &str, prefix: &str, page_dir: &str, static_files: Option<&mut BTreeSet<String>>) -> Option<String> {
+fn rewrite_srcset(value: &str, prefix: &str, page_dir: &str, assets: &mut AssetConfig) -> Result<String> {
+    let mut rewritten_candidates = Vec::new();
+    for candidate in value.split(',') {
+        let leading = candidate.len() - candidate.trim_start().len();
+        let trimmed_start = &candidate[leading..];
+        let trailing = trimmed_start.len() - trimmed_start.trim_end().len();
+        let core = &trimmed_start[..trimmed_start.len() - trailing];
+        let mut parts = core.splitn(2, char::is_whitespace);
+        let url = parts.next().unwrap_or("");
+        let descriptor = parts.next().unwrap_or("");
+        let rewritten = prefix_asset_url(url, prefix, page_dir, assets)?.unwrap_or_else(|| url.to_string());
+        rewritten_candidates.push(format!(
+            "{}{}{}{}{}",
+            &candidate[..leading],
+            rewritten,
+            if descriptor.is_empty() { "" } else { " " },
+            descriptor,
+            &trimmed_start[trimmed_start.len() - trailing..],
+        ));
+    }
+    Ok(rewritten_candidates.join(","))
+}
+
+fn rewrite_asset_url_value(attr: &str, value: &str, prefix: &str, page_dir: &str, assets: &mut AssetConfig) -> Result<Option<String>> {
+    if attr.eq_ignore_ascii_case("href") && !is_asset_like_url(value) {
+        return Ok(None);
+    }
+    prefix_asset_url(value, prefix, page_dir, assets)
+}
+
+fn prefix_asset_url(value: &str, prefix: &str, page_dir: &str, assets: &mut AssetConfig) -> Result<Option<String>> {
     if is_external_or_special_url(value) || value == "/" {
-        return None;
+        return Ok(None);
     }
     let (path_part, suffix) = split_url_path_suffix(value);
     let site_path = if let Some(path) = path_part.strip_prefix('/') {
-        normalize_site_path("", path)?
+        normalize_site_path("", path)
     } else {
-        normalize_site_path(page_dir, path_part)?
+        normalize_site_path(page_dir, path_part)
     };
+    let Some(site_path) = site_path else { return Ok(None); };
     if site_path.is_empty() {
-        return None;
+        return Ok(None);
     }
-    if let Some(static_files) = static_files {
-        static_files.insert(site_path.clone());
-    }
-    Some(format!("{prefix}/{site_path}{suffix}"))
+    let Some(asset) = resolve_static_asset(assets, &site_path)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!("{prefix}/{}{}", asset.key, suffix)))
 }
 
 fn is_external_or_special_url(value: &str) -> bool {
@@ -1452,6 +1482,62 @@ fn normalize_site_path(page_dir: &str, value: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
+fn resolve_static_asset(assets: &mut AssetConfig, site_path: &str) -> Result<Option<StaticAsset>> {
+    if let Some(asset) = assets.generated.get(site_path) {
+        return Ok(Some(asset.clone()));
+    }
+
+    let source_path = assets.source_dir.join(site_path);
+    let asset = if source_path.is_file() {
+        let bytes = fs::read(&source_path)
+            .with_context(|| format!("reading asset {}", source_path.display()))?;
+        let hash = content_hash(&bytes);
+        StaticAsset {
+            source: site_path.to_string(),
+            key: hashed_asset_key(site_path, &hash),
+            hash,
+        }
+    } else if let Some(asset) = assets.manifest.get(site_path) {
+        asset.clone()
+    } else {
+        eprintln!(
+            "warning: asset {} is referenced but {} does not exist and no manifest entry was found; leaving URL unchanged",
+            site_path,
+            source_path.display(),
+        );
+        return Ok(None);
+    };
+
+    assets.generated.insert(site_path.to_string(), asset.clone());
+    Ok(Some(asset))
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}").chars().take(12).collect()
+}
+
+fn hashed_asset_key(site_path: &str, hash: &str) -> String {
+    let path = Path::new(site_path);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return format!("{site_path}.{hash}");
+    };
+    let hashed_name = match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            format!("{stem}.{hash}.{ext}")
+        }
+        _ => format!("{file_name}.{hash}"),
+    };
+    match path.parent().and_then(|parent| parent.to_str()) {
+        Some(parent) if !parent.is_empty() => format!("{}/{}", parent.replace('\\', "/"), hashed_name),
+        _ => hashed_name,
+    }
+}
+
 fn is_asset_like_url(value: &str) -> bool {
     if is_external_or_special_url(value) || value == "/" {
         return false;
@@ -1467,12 +1553,49 @@ fn is_asset_like_url(value: &str) -> bool {
     !matches!(ext.to_ascii_lowercase().as_str(), "html" | "htm" | "md" | "org")
 }
 
-fn write_static_file_list(path: &Path, files: &BTreeSet<String>) -> Result<()> {
+fn read_static_file_list(path: &Path) -> Result<BTreeMap<String, StaticAsset>> {
+    let mut assets = BTreeMap::new();
+    if !path.exists() {
+        return Ok(assets);
+    }
+
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading static file list {}", path.display()))?;
+    for (index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split('\t');
+        let Some(source) = parts.next() else { continue; };
+        let Some(key) = parts.next() else {
+            return Err(anyhow!("{}:{} is missing an asset key", path.display(), index + 1));
+        };
+        let Some(hash) = parts.next() else {
+            return Err(anyhow!("{}:{} is missing an asset hash", path.display(), index + 1));
+        };
+        if parts.next().is_some() {
+            return Err(anyhow!("{}:{} has too many columns", path.display(), index + 1));
+        }
+        assets.insert(source.to_string(), StaticAsset {
+            source: source.to_string(),
+            key: key.to_string(),
+            hash: hash.to_string(),
+        });
+    }
+    Ok(assets)
+}
+
+fn write_static_file_list(path: &Path, files: &BTreeMap<String, StaticAsset>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let mut contents = files.iter().cloned().collect::<Vec<_>>().join("\n");
+    let mut contents = files
+        .values()
+        .map(|asset| format!("{}\t{}\t{}", asset.source, asset.key, asset.hash))
+        .collect::<Vec<_>>()
+        .join("\n");
     if !contents.is_empty() {
         contents.push('\n');
     }
@@ -2470,6 +2593,23 @@ fn highlight_code_blocks_in_html(input_html: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_assets(prefix: &str, entries: &[(&str, &str, &str)]) -> AssetConfig {
+        let mut manifest = BTreeMap::new();
+        for (source, key, hash) in entries {
+            manifest.insert((*source).to_string(), StaticAsset {
+                source: (*source).to_string(),
+                key: (*key).to_string(),
+                hash: (*hash).to_string(),
+            });
+        }
+        AssetConfig {
+            prefix: Some(prefix.trim_end_matches('/').to_string()),
+            source_dir: PathBuf::from("src"),
+            manifest,
+            generated: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn parses_code_block_language_code_and_settings_by_id() {
         let markdown = "```text\nskip\n```\n\n```python cwd=examples env.MODE=test flag\nprint('ok')\n```\n";
@@ -2528,10 +2668,12 @@ mod tests {
             exec_languages: vec!["python".to_string()],
             ..PageLangCtx::default()
         };
+        let mut assets = AssetConfig::default();
         let with_execution =
-            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, Some(&enabled), &AssetConfig::default(), None);
+            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, Some(&enabled), &mut assets).unwrap();
+        let mut assets = AssetConfig::default();
         let without_execution =
-            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, None, &AssetConfig::default(), None);
+            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, None, &mut assets).unwrap();
 
         assert!(with_execution.contains(r#"data-block-id="temp-"#));
         assert!(with_execution.contains(r#"class="run-code""#));
@@ -2567,7 +2709,15 @@ mod tests {
 
     #[test]
     fn rewrites_root_relative_asset_urls_only() {
-        let assets = AssetConfig::new(Some("https://assets.example.com/".to_string()));
+        let mut assets = test_assets("https://assets.example.com/", &[
+            ("images/a.png", "images/a.111111111111.png", "111111111111"),
+            ("audio/theme.mp3", "audio/theme.222222222222.mp3", "222222222222"),
+            ("posters/hero.jpg", "posters/hero.333333333333.jpg", "333333333333"),
+            ("small.png", "small.444444444444.png", "444444444444"),
+            ("large.png", "large.555555555555.png", "555555555555"),
+            ("style.css", "style.666666666666.css", "666666666666"),
+            ("files/book.pdf", "files/book.777777777777.pdf", "777777777777"),
+        ]);
         let html = concat!(
             r#"<img src="/images/a.png">"#,
             r#"<audio src='/audio/theme.mp3'></audio>"#,
@@ -2579,36 +2729,38 @@ mod tests {
             r#"<img src="//cdn.example.com/already.png">"#,
         );
 
-        let rewritten = rewrite_asset_urls(html, &assets, "posts/2026");
+        let rewritten = rewrite_asset_urls(html, &mut assets, "posts/2026").unwrap();
 
-        assert!(rewritten.contains(r#"src="https://assets.example.com/images/a.png""#));
-        assert!(rewritten.contains(r#"src='https://assets.example.com/audio/theme.mp3'"#));
-        assert!(rewritten.contains(r#"poster="https://assets.example.com/posters/hero.jpg""#));
-        assert!(rewritten.contains(r#"srcset="https://assets.example.com/small.png 1x, https://assets.example.com/large.png 2x, https://cdn.example.com/x.png 3x""#));
-        assert!(rewritten.contains(r#"href="https://assets.example.com/style.css""#));
+        assert!(rewritten.contains(r#"src="https://assets.example.com/images/a.111111111111.png""#));
+        assert!(rewritten.contains(r#"src='https://assets.example.com/audio/theme.222222222222.mp3'"#));
+        assert!(rewritten.contains(r#"poster="https://assets.example.com/posters/hero.333333333333.jpg""#));
+        assert!(rewritten.contains(r#"srcset="https://assets.example.com/small.444444444444.png 1x, https://assets.example.com/large.555555555555.png 2x, https://cdn.example.com/x.png 3x""#));
+        assert!(rewritten.contains(r#"href="https://assets.example.com/style.666666666666.css""#));
         assert!(rewritten.contains(r#"<a href="/guide.html">Guide</a>"#));
-        assert!(rewritten.contains(r#"<a href="https://assets.example.com/files/book.pdf">PDF</a>"#));
+        assert!(rewritten.contains(r#"<a href="https://assets.example.com/files/book.777777777777.pdf">PDF</a>"#));
         assert!(rewritten.contains(r#"src="//cdn.example.com/already.png""#));
     }
 
     #[test]
     fn rewrites_relative_asset_urls_from_page_directory() {
-        let assets = AssetConfig::new(Some("https://assets.example.com/".to_string()));
+        let mut assets = test_assets("https://assets.example.com/", &[
+            ("lessons/audio/n2-aging-society.mp3", "lessons/audio/n2-aging-society.aaaaaaaaaaaa.mp3", "aaaaaaaaaaaa"),
+            ("lessons/n2/images/chart.png", "lessons/n2/images/chart.bbbbbbbbbbbb.png", "bbbbbbbbbbbb"),
+            ("lessons/audio/transcript.pdf", "lessons/audio/transcript.cccccccccccc.pdf", "cccccccccccc"),
+        ]);
         let html = concat!(
             r#"<audio src="../audio/n2-aging-society.mp3?version=1"></audio>"#,
             r#"<img src="./images/chart.png#v2">"#,
             r#"<a href="../audio/transcript.pdf">Transcript</a>"#,
         );
-        let mut files = BTreeSet::new();
+        let rewritten = rewrite_asset_urls_collect(html, &mut assets, "lessons/n2").unwrap();
 
-        let rewritten = rewrite_asset_urls_collect(html, &assets, "lessons/n2", &mut files);
-
-        assert!(rewritten.contains(r#"src="https://assets.example.com/lessons/audio/n2-aging-society.mp3?version=1""#));
-        assert!(rewritten.contains(r#"src="https://assets.example.com/lessons/n2/images/chart.png#v2""#));
-        assert!(rewritten.contains(r#"href="https://assets.example.com/lessons/audio/transcript.pdf""#));
-        assert!(files.contains("lessons/audio/n2-aging-society.mp3"));
-        assert!(files.contains("lessons/n2/images/chart.png"));
-        assert!(files.contains("lessons/audio/transcript.pdf"));
+        assert!(rewritten.contains(r#"src="https://assets.example.com/lessons/audio/n2-aging-society.aaaaaaaaaaaa.mp3?version=1""#));
+        assert!(rewritten.contains(r#"src="https://assets.example.com/lessons/n2/images/chart.bbbbbbbbbbbb.png#v2""#));
+        assert!(rewritten.contains(r#"href="https://assets.example.com/lessons/audio/transcript.cccccccccccc.pdf""#));
+        assert!(assets.generated.contains_key("lessons/audio/n2-aging-society.mp3"));
+        assert!(assets.generated.contains_key("lessons/n2/images/chart.png"));
+        assert!(assets.generated.contains_key("lessons/audio/transcript.pdf"));
     }
 
     #[test]
@@ -2626,6 +2778,13 @@ mod tests {
         fs::write(src.join("audio").join("theme.mp3"), b"audio").unwrap();
         fs::write(src.join("robots.txt"), "User-agent: *\n").unwrap();
         let manifest = out.join("static-files.txt");
+        let hash = content_hash(b"audio");
+        let expected_key = format!("audio/theme.{hash}.mp3");
+        let mut assets = AssetConfig::new(
+            Some("https://assets.example.com".to_string()),
+            &src,
+            &manifest,
+        ).unwrap();
 
         build_all(
             &src,
@@ -2633,7 +2792,7 @@ mod tests {
             &ThemeConfig::default(),
             &LangConfig::default(),
             false,
-            &AssetConfig::new(Some("https://assets.example.com".to_string())),
+            &mut assets,
             &manifest,
         ).unwrap();
 
@@ -2641,8 +2800,81 @@ mod tests {
         let list = fs::read_to_string(&manifest).unwrap();
         let _ = fs::remove_dir_all(&root);
 
-        assert!(page.contains(r#"src="https://assets.example.com/audio/theme.mp3""#));
-        assert_eq!(list, "audio/theme.mp3\n");
+        assert!(page.contains(&format!(r#"src="https://assets.example.com/{expected_key}""#)));
+        assert_eq!(list, format!("audio/theme.mp3\t{expected_key}\t{hash}\n"));
+    }
+
+    #[test]
+    fn build_uses_manifest_when_asset_file_is_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "haystack-static-manifest-test-{}-{}",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let src = root.join("src");
+        let out = root.join("output");
+        fs::create_dir_all(src.join("posts")).unwrap();
+        fs::write(src.join("posts").join("index.md"), "# Home\n\n<audio src=\"../audio/theme.mp3\"></audio>\n").unwrap();
+        let manifest = root.join("static-assets.txt");
+        fs::write(&manifest, "audio/theme.mp3\taudio/theme.abc123.mp3\tabc123\n").unwrap();
+        let mut assets = AssetConfig::new(
+            Some("https://assets.example.com".to_string()),
+            &src,
+            &manifest,
+        ).unwrap();
+
+        build_all(
+            &src,
+            &out,
+            &ThemeConfig::default(),
+            &LangConfig::default(),
+            false,
+            &mut assets,
+            &manifest,
+        ).unwrap();
+
+        let page = fs::read_to_string(out.join("posts").join("index.html")).unwrap();
+        let list = fs::read_to_string(&manifest).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(page.contains(r#"src="https://assets.example.com/audio/theme.abc123.mp3""#));
+        assert_eq!(list, "audio/theme.mp3\taudio/theme.abc123.mp3\tabc123\n");
+    }
+
+    #[test]
+    fn build_leaves_missing_asset_without_manifest_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "haystack-static-missing-test-{}-{}",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let src = root.join("src");
+        let out = root.join("output");
+        fs::create_dir_all(src.join("posts")).unwrap();
+        fs::write(src.join("posts").join("index.md"), "# Home\n\n<audio src=\"../audio/missing.mp3\"></audio>\n").unwrap();
+        let manifest = root.join("static-assets.txt");
+        let mut assets = AssetConfig::new(
+            Some("https://assets.example.com".to_string()),
+            &src,
+            &manifest,
+        ).unwrap();
+
+        build_all(
+            &src,
+            &out,
+            &ThemeConfig::default(),
+            &LangConfig::default(),
+            false,
+            &mut assets,
+            &manifest,
+        ).unwrap();
+
+        let page = fs::read_to_string(out.join("posts").join("index.html")).unwrap();
+        let list = fs::read_to_string(&manifest).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(page.contains(r#"src="../audio/missing.mp3""#));
+        assert_eq!(list, "");
     }
 
     #[test]
@@ -2704,8 +2936,9 @@ mod tests {
 
         save_result(&save, b"## Result\n\nValue: $x^2$\n").unwrap();
         let updated = fs::read_to_string(&path).unwrap();
+        let mut assets = AssetConfig::default();
         let rendered =
-            convert_markdown_to_html_with_ctx(&updated, &ThemeConfig::default(), None, &AssetConfig::default(), None);
+            convert_markdown_to_html_with_ctx(&updated, &ThemeConfig::default(), None, &mut assets).unwrap();
         let _ = fs::remove_file(&path);
 
         assert!(updated.contains("```markdown haystack-result=example"));
@@ -2735,8 +2968,9 @@ mod tests {
 
         save_result(&save, jsonl.as_bytes()).unwrap();
         let updated = fs::read_to_string(&path).unwrap();
+        let mut assets = AssetConfig::default();
         let rendered =
-            convert_markdown_to_html_with_ctx(&updated, &ThemeConfig::default(), None, &AssetConfig::default(), None);
+            convert_markdown_to_html_with_ctx(&updated, &ThemeConfig::default(), None, &mut assets).unwrap();
         let _ = fs::remove_file(&path);
 
         assert!(updated.contains("```codex haystack-result=agent"));
