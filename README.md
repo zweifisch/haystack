@@ -29,21 +29,38 @@ cargo build --locked --release --target aarch64-apple-darwin
 ### Build site to `output/`:
 
 ```sh
-haystack build [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES]
+haystack build [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES] [--asset-prefix URL] [--static-file-list PATH]
 ```
 
 - Scans `src/` for `*.md` and `*.org` (recursively).
 - Writes corresponding `*.html` into `output/`, preserving subdirectories.
+- Writes `output/static-files.txt` with one prefixed static asset reference per line.
 - With `--index`, also writes `output/index.html` with links to all Markdown/Org files.
  - Multi-language (optional):
    - Provide `--langs en,zh,fr` (first is default, unprefixed).
    - Default language lives in `src/`; others in `src/<lang>/`.
    - Output mirrors this: `output/` (default) and `output/<lang>/` for others.
+- With `--asset-prefix`, root-relative asset URLs in rendered Markdown/Org and copied
+  HTML are rewritten to the prefix. Page links such as `/post.html` are left unchanged.
+  This is useful when large assets are ignored in git and uploaded separately:
+
+```sh
+aws s3 sync ./src/audio s3://my-bucket/audio \
+  --endpoint-url https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+haystack build --asset-prefix https://assets.example.com
+```
+
+Or upload exactly the referenced prefixed assets with Wrangler:
+
+```sh
+haystack build --asset-prefix https://assets.example.com
+scripts/upload-static-files-to-r2.sh --remote my-bucket
+```
 
 ### Serve on-demand HTML from `src/`:
 
 ```sh
-haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME] [--langs CODES] [--allow-exec]
+haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME] [--langs CODES] [--allow-exec] [--asset-prefix URL]
 ```
 
 - Request `/<path>.html` → serves `src/<path>.md` or `src/<path>.org` rendered to HTML (default language, unprefixed).
@@ -96,6 +113,25 @@ print("hello")
 - The server re-reads the Markdown and selects the block by ID; code is not
   accepted from the browser.
 - Output from stdout and stderr is streamed into the rendered page.
+
+On the first run, Haystack adds a stable `id` to the executable fence. Output
+is written back to a marked result fence after every completed run:
+
+````markdown
+```python id=b-7fa31c2d
+print("hello")
+```
+
+<!-- haystack-result: b-7fa31c2d -->
+```text haystack-result=b-7fa31c2d
+hello
+```
+````
+
+An existing result for the same ID is replaced. Result fences are not
+executable, and Haystack expands their backtick fence when the output itself
+contains backticks. Markdown and Codex result fences use `markdown` and
+`codex` types and are rendered with their corresponding output renderers.
 
 Enabling this option permits visitors who can access the server to run marked
 code using the server process's OS permissions. Use it only on trusted content

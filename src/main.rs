@@ -1,9 +1,11 @@
 use std::fs;
 use std::io::Read;
 use std::io::Write;
-use std::path::Path;
-use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -42,6 +44,12 @@ enum Commands {
         /// Languages (comma-separated). First is default (unprefixed). Example: "en,zh,fr"
         #[arg(long, value_name = "CODES")]
         langs: Option<String>,
+        /// Prefix root-relative static asset URLs in rendered/copied HTML
+        #[arg(long, value_name = "URL")]
+        asset_prefix: Option<String>,
+        /// Write a newline-delimited list of copied static files
+        #[arg(long, value_name = "PATH", default_value = "output/static-files.txt")]
+        static_file_list: PathBuf,
     },
     /// Serve on-demand HTML from src/*.md and src/*.org
     Serve {
@@ -60,6 +68,9 @@ enum Commands {
         /// Allow supported Markdown code blocks to be executed from rendered pages
         #[arg(long, default_value_t = false)]
         allow_exec: bool,
+        /// Prefix root-relative static asset URLs in rendered HTML
+        #[arg(long, value_name = "URL")]
+        asset_prefix: Option<String>,
     },
     /// List available syntax highlighting themes
     Themes,
@@ -112,23 +123,39 @@ impl LangConfig {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct AssetConfig {
+    prefix: Option<String>,
+}
+
+impl AssetConfig {
+    fn new(prefix: Option<String>) -> Self {
+        let prefix = prefix
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+        Self { prefix }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { theme_light, theme_dark, index, langs } => {
+        Commands::Build { theme_light, theme_dark, index, langs, asset_prefix, static_file_list } => {
             let src = Path::new("src");
             let out = Path::new("output");
             let theme = ThemeConfig { light: theme_light, dark: theme_dark };
             let lang = LangConfig::new(langs);
-            build_all(src, out, &theme, &lang, index)?;
+            let assets = AssetConfig::new(asset_prefix);
+            build_all(src, out, &theme, &lang, index, &assets, &static_file_list)?;
         }
-        Commands::Serve { port, theme_light, theme_dark, langs, allow_exec } => {
+        Commands::Serve { port, theme_light, theme_dark, langs, allow_exec, asset_prefix } => {
             let src = Path::new("src");
             let theme = ThemeConfig { light: theme_light, dark: theme_dark };
             let lang = LangConfig::new(langs);
+            let assets = AssetConfig::new(asset_prefix);
             let execution = ExecutionConfig::load()?;
-            serve(port, src, &theme, &lang, allow_exec, &execution)?;
+            serve(port, src, &theme, &lang, allow_exec, &execution, &assets)?;
         }
         Commands::Themes => {
             list_themes();
@@ -138,11 +165,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangConfig, generate_index: bool) -> Result<()> {
+fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangConfig, generate_index: bool, assets: &AssetConfig, static_file_list: &Path) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
     fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    let mut static_files = BTreeSet::new();
 
     // Helper to process a single language subtree
     fn process_lang(
@@ -153,6 +181,8 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
         href_prefix: &str,
         generate_index: bool,
         cfg: &LangConfig,
+        assets: &AssetConfig,
+        static_files: &mut BTreeSet<String>,
     ) -> Result<()> {
         let src_root = base_src.join(rel_root);
         let out_root = base_out.join(rel_root);
@@ -172,7 +202,7 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
                         if let Some(parent) = out_path.parent() { fs::create_dir_all(parent)?; }
 
                         // Build page with language switcher context
-                        let html = convert_file_with_lang(path, theme, &build_page_ctx(&base_src, &rel_root, rel, cfg))?;
+                        let html = convert_file_with_lang(path, theme, &build_page_ctx(&base_src, &rel_root, rel, cfg), assets, Some(static_files))?;
                         fs::write(&out_path, html).with_context(|| format!("writing output file {}", out_path.display()))?;
                         println!("Built {} -> {}", path.display(), out_path.display());
                     }
@@ -181,7 +211,16 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
                         doc_paths.push(rel.to_path_buf());
                         let out_path = out_root.join(rel);
                         if let Some(parent) = out_path.parent() { fs::create_dir_all(parent)?; }
-                        fs::copy(path, &out_path).with_context(|| format!("copying html {} -> {}", path.display(), out_path.display()))?;
+                        if assets.prefix.is_some() {
+                            let html = fs::read_to_string(path).with_context(|| format!("reading html {}", path.display()))?;
+                            let page_dir = rel_root
+                                .join(rel.parent().unwrap_or_else(|| Path::new("")))
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            fs::write(&out_path, rewrite_asset_urls_collect(&html, assets, &page_dir, static_files)).with_context(|| format!("writing html {}", out_path.display()))?;
+                        } else {
+                            fs::copy(path, &out_path).with_context(|| format!("copying html {} -> {}", path.display(), out_path.display()))?;
+                        }
                         println!("Copied {} -> {}", path.display(), out_path.display());
                     }
                     _ => {
@@ -207,19 +246,20 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
     }
 
     // Build default (unprefixed) subtree: skip language folders for non-default languages
-    process_lang(src_dir, out_dir, theme, Path::new(""), "", generate_index, lang)?;
+    process_lang(src_dir, out_dir, theme, Path::new(""), "", generate_index, lang, assets, &mut static_files)?;
 
     // Build each non-default language under its prefix if configured
     for lang_code in &lang.others {
         let rel_root = Path::new(lang_code);
         if src_dir.join(rel_root).exists() {
-            process_lang(src_dir, out_dir, theme, rel_root, &format!("{}/", lang_code), generate_index, lang)?;
+            process_lang(src_dir, out_dir, theme, rel_root, &format!("{}/", lang_code), generate_index, lang, assets, &mut static_files)?;
         }
     }
+    write_static_file_list(static_file_list, &static_files)?;
     Ok(())
 }
 
-fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, allow_exec: bool, execution: &ExecutionConfig) -> Result<()> {
+fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, allow_exec: bool, execution: &ExecutionConfig, assets: &AssetConfig) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
     }
@@ -289,7 +329,14 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
 
             if html_path.exists() {
                 match fs::read_to_string(&html_path) {
-                    Ok(s) => Response::from_string(s)
+                    Ok(s) => {
+                        let page_dir = Path::new(path)
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        Response::from_string(rewrite_asset_urls(&s, assets, &page_dir))
+                    }
                         .with_status_code(200)
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
                     Err(e) => Response::from_string(format!("Error reading {}: {}", html_path.display(), e))
@@ -306,7 +353,7 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
                     ctx.exec_source = Some(source);
                     ctx.exec_languages = execution.languages();
                 }
-                match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html_with_ctx(&s, theme, ctx.as_ref())) {
+                match fs::read_to_string(&md_path).map(|s| convert_markdown_to_html_with_ctx(&s, theme, ctx.as_ref(), assets, None)) {
                     Ok(html) => Response::from_string(html)
                         .with_status_code(200)
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
@@ -315,7 +362,7 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
                 }
             } else if org_path.exists() {
                 let ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg);
-                match fs::read_to_string(&org_path).map(|s| convert_org_to_html_with_ctx(&s, theme, ctx.as_ref())) {
+                match fs::read_to_string(&org_path).map(|s| convert_org_to_html_with_ctx(&s, theme, ctx.as_ref(), assets, None)) {
                     Ok(html) => Response::from_string(html)
                         .with_status_code(200)
                         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
@@ -355,6 +402,7 @@ struct MarkdownCodeBlock {
     language: String,
     code: String,
     settings: BTreeMap<String, String>,
+    source_start: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -474,35 +522,231 @@ fn parse_fence_info(info: &str) -> (String, BTreeMap<String, String>) {
 }
 
 fn markdown_code_block(input: &str, wanted_id: &str) -> Option<MarkdownCodeBlock> {
-    let wanted = wanted_id.strip_prefix("code-")?.parse::<usize>().ok()?;
-    let parser = MdParser::new_ext(input, Options::all());
-    let mut index = 0usize;
-    let mut current: Option<(String, String)> = None;
-    for event in parser {
+    let parser = MdParser::new_ext(input, Options::all()).into_offset_iter();
+    let mut current: Option<(String, String, usize)> = None;
+    let mut matches = Vec::new();
+    let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+    for (event, range) in parser {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
-                index += 1;
                 let info = match kind {
                     CodeBlockKind::Fenced(info) => info.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                current = Some((info, String::new()));
+                current = Some((info, String::new(), range.start));
             }
             Event::Text(text) if current.is_some() => {
                 current.as_mut().unwrap().1.push_str(&text);
             }
             Event::End(TagEnd::CodeBlock) => {
-                if index == wanted {
-                    let (info, code) = current.take()?;
-                    let (language, settings) = parse_fence_info(&info);
-                    return Some(MarkdownCodeBlock { language, code, settings });
+                let (info, code, source_start) = current.take()?;
+                let (language, settings) = parse_fence_info(&info);
+                if settings.contains_key("haystack-result") {
+                    continue;
                 }
-                current = None;
+                let explicit_id = settings.get("id").map(String::as_str);
+                let fingerprint = block_fingerprint(&language, &code);
+                let occurrence = occurrences.entry(fingerprint.clone()).or_default();
+                let temporary_id = format!("{fingerprint}-{}", *occurrence);
+                *occurrence += 1;
+                if explicit_id == Some(wanted_id) || temporary_id == wanted_id {
+                    matches.push(MarkdownCodeBlock {
+                        language,
+                        code,
+                        settings,
+                        source_start,
+                    });
+                }
             }
             _ => {}
         }
     }
+    if matches.len() == 1 { matches.pop() } else { None }
+}
+
+fn block_fingerprint(language: &str, code: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in language.bytes().chain([0]).chain(code.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("temp-{hash:016x}")
+}
+
+static BLOCK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn generate_block_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let counter = BLOCK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut value = nanos
+        ^ u64::from(std::process::id()).rotate_left(17)
+        ^ counter.wrapping_mul(0x9e3779b97f4a7c15);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d049bb133111eb);
+    value ^= value >> 31;
+    format!("b-{:08x}", value as u32)
+}
+
+fn valid_block_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn ensure_block_id(path: &Path, input: &str, block: &MarkdownCodeBlock) -> Result<String> {
+    if let Some(id) = block.settings.get("id") {
+        if !valid_block_id(id) {
+            return Err(anyhow!(
+                "block id must contain only letters, numbers, '-' or '_'"
+            ));
+        }
+        return Ok(id.clone());
+    }
+    let id = loop {
+        let candidate = generate_block_id();
+        if !input.contains(&format!("id={candidate}")) {
+            break candidate;
+        }
+    };
+    let line_end = input[block.source_start..]
+        .find('\n')
+        .map(|offset| block.source_start + offset)
+        .unwrap_or(input.len());
+    let insert_at = if line_end > 0 && input.as_bytes()[line_end - 1] == b'\r' {
+        line_end - 1
+    } else {
+        line_end
+    };
+    let mut updated = String::with_capacity(input.len() + id.len() + 4);
+    updated.push_str(&input[..insert_at]);
+    updated.push_str(" id=");
+    updated.push_str(&id);
+    updated.push_str(&input[insert_at..]);
+    atomic_write(path, &updated)?;
+    Ok(id)
+}
+
+fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("document");
+    let temp = path.with_file_name(format!(".{file_name}.haystack.tmp"));
+    fs::write(&temp, contents).with_context(|| format!("writing {}", temp.display()))?;
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(&temp, metadata.permissions())
+            .with_context(|| format!("preserving permissions for {}", path.display()))?;
+    }
+    fs::rename(&temp, path).with_context(|| format!("replacing {}", path.display()))
+}
+
+#[derive(Clone)]
+struct ResultSave {
+    path: PathBuf,
+    block_id: String,
+    executed_code: String,
+    output_format: OutputFormat,
+}
+
+fn fenced_block_end(input: &str, source_start: usize) -> Option<usize> {
+    let line_start = input[..source_start].rfind('\n').map(|index| index + 1).unwrap_or(0);
+    let opening_end = input[line_start..].find('\n').map(|offset| line_start + offset + 1)?;
+    let opening = input[line_start..opening_end].trim_start();
+    let marker = opening.as_bytes().first().copied()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let marker_len = opening.bytes().take_while(|byte| *byte == marker).count();
+    if marker_len < 3 {
+        return None;
+    }
+    let mut offset = opening_end;
+    while offset < input.len() {
+        let next = input[offset..]
+            .find('\n')
+            .map(|length| offset + length + 1)
+            .unwrap_or(input.len());
+        let line = input[offset..next].trim();
+        let closing_len = line.bytes().take_while(|byte| *byte == marker).count();
+        if closing_len >= marker_len && line[closing_len..].trim().is_empty() {
+            return Some(next);
+        }
+        offset = next;
+    }
     None
+}
+
+fn result_fence(output: &str) -> String {
+    let mut longest = 0usize;
+    let mut current = 0usize;
+    for byte in output.bytes() {
+        if byte == b'`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    "`".repeat(3.max(longest + 1))
+}
+
+fn save_result(save: &ResultSave, output: &[u8]) -> Result<()> {
+    let output = String::from_utf8_lossy(output);
+    let current = fs::read_to_string(&save.path)
+        .with_context(|| format!("reading {}", save.path.display()))?;
+    let block = markdown_code_block(&current, &save.block_id)
+        .ok_or_else(|| anyhow!("code block {} no longer exists", save.block_id))?;
+    if block.code != save.executed_code {
+        return Err(anyhow!(
+            "code block {} changed while it was running",
+            save.block_id
+        ));
+    }
+    let block_end = fenced_block_end(&current, block.source_start)
+        .ok_or_else(|| anyhow!("cannot locate end of code block {}", save.block_id))?;
+    let marker = format!("<!-- haystack-result: {} -->", save.block_id);
+    let fence = result_fence(&output);
+    let format = match save.output_format {
+        OutputFormat::Text => "text",
+        OutputFormat::Markdown => "markdown",
+        OutputFormat::Codex => "codex",
+    };
+    let result = format!(
+        "{marker}\n{fence}{format} haystack-result={}\n{}{newline}{fence}\n",
+        save.block_id,
+        output,
+        newline = if output.ends_with('\n') { "" } else { "\n" },
+    );
+
+    let updated = if let Some(marker_start) = current.find(&marker) {
+        let result_start = marker_start + marker.len();
+        let following = current[result_start..]
+            .find(|character: char| !character.is_whitespace())
+            .map(|offset| result_start + offset)
+            .ok_or_else(|| anyhow!("result marker {} has no fenced block", save.block_id))?;
+        let result_end = fenced_block_end(&current, following)
+            .ok_or_else(|| anyhow!("result marker {} is not followed by a fenced block", save.block_id))?;
+        format!("{}{}{}", &current[..marker_start], result, &current[result_end..])
+    } else {
+        let separator = if block_end > 0 && current[..block_end].ends_with("\n\n") {
+            ""
+        } else if current[..block_end].ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        format!(
+            "{}{}{}{}",
+            &current[..block_end],
+            separator,
+            result,
+            &current[block_end..],
+        )
+    };
+    atomic_write(&save.path, &updated)
 }
 
 fn handle_run_request(request: Request, url: &str, src_dir: &Path, allow_exec: bool, execution: &ExecutionConfig) {
@@ -576,6 +820,16 @@ fn handle_run_request(request: Request, url: &str, src_dir: &Path, allow_exec: b
         let _ = request.respond(Response::from_string("Unsupported code block language").with_status_code(400));
         return;
     };
+    let stable_id = match ensure_block_id(&canonical_source, &input, &block) {
+        Ok(id) => id,
+        Err(error) => {
+            let _ = request.respond(
+                Response::from_string(format!("Failed to assign block id: {error}"))
+                    .with_status_code(500),
+            );
+            return;
+        }
+    };
     let code_argument = runner.args.iter().any(|arg| arg.contains("{code}"));
     let source_dir = canonical_source.parent().unwrap_or(&canonical_root);
     let working_dir = if let Some(relative) = block.settings.get("cwd") {
@@ -641,7 +895,25 @@ fn handle_run_request(request: Request, url: &str, src_dir: &Path, allow_exec: b
             if tx.send(OutputChunk::Stderr(buf[..n].to_vec())).is_err() { break; }
         }
     });
-        let reader = ChannelExecutionOutput { child, receiver: rx, pending: Vec::new() };
+    let save = ResultSave {
+        path: canonical_source.clone(),
+        block_id: stable_id,
+        executed_code: block.code.clone(),
+        output_format: runner.output_format,
+    };
+    let stream_save = if matches!(runner.output_format, OutputFormat::Codex) {
+        None
+    } else {
+        Some(save.clone())
+    };
+    let reader = ChannelExecutionOutput {
+        child,
+        receiver: rx,
+        pending: Vec::new(),
+        captured: Vec::new(),
+        save: stream_save,
+        finished: false,
+    };
     match runner.output_format {
         OutputFormat::Text => {
             let response = Response::new(
@@ -676,7 +948,9 @@ fn handle_run_request(request: Request, url: &str, src_dir: &Path, allow_exec: b
         }
         OutputFormat::Codex => {
             let (stdout, stderr) = reader.collect_separated();
-            let response = match render_codex_output(&stdout, &stderr) {
+            let response = match save_result(&save, &stdout)
+                .and_then(|_| render_codex_output(&stdout, &stderr))
+            {
                 Ok(html) => Response::from_string(html).with_status_code(200),
                 Err(error) => Response::from_string(error.to_string()).with_status_code(500),
             }
@@ -698,6 +972,9 @@ struct ChannelExecutionOutput {
     child: std::process::Child,
     receiver: std::sync::mpsc::Receiver<OutputChunk>,
     pending: Vec<u8>,
+    captured: Vec<u8>,
+    save: Option<ResultSave>,
+    finished: bool,
 }
 
 impl ChannelExecutionOutput {
@@ -712,6 +989,19 @@ impl ChannelExecutionOutput {
         }
         let _ = self.child.wait();
         (stdout, stderr)
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        self.child.wait()?;
+        if let Some(save) = &self.save {
+            save_result(save, &self.captured)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -729,10 +1019,11 @@ impl Read for ChannelExecutionOutput {
         while self.pending.is_empty() {
             match self.receiver.recv() {
                 Ok(OutputChunk::Stdout(bytes)) | Ok(OutputChunk::Stderr(bytes)) => {
-                    self.pending = bytes
+                    self.captured.extend_from_slice(&bytes);
+                    self.pending = bytes;
                 }
                 Err(_) => {
-                    let _ = self.child.wait();
+                    self.finish()?;
                     return Ok(0);
                 }
             }
@@ -756,7 +1047,7 @@ fn executable_code_html(highlighted: &str, source: &str, block_id: &str, info: &
 
 // removed legacy convert_file (replaced by convert_file_with_lang)
 
-fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx) -> Result<String> {
+fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx, assets: &AssetConfig, static_files: Option<&mut BTreeSet<String>>) -> Result<String> {
     let mut file = fs::File::open(path)
         .with_context(|| format!("opening input file {}", path.display()))?;
     let mut buf = String::new();
@@ -764,8 +1055,8 @@ fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx) -
         .with_context(|| format!("reading input file {}", path.display()))?;
 
     let html = match path.extension().and_then(|s| s.to_str()) {
-        Some("md") => convert_markdown_to_html_with_ctx(&buf, theme, Some(ctx)),
-        Some("org") => convert_org_to_html_with_ctx(&buf, theme, Some(ctx)),
+        Some("md") => convert_markdown_to_html_with_ctx(&buf, theme, Some(ctx), assets, static_files),
+        Some("org") => convert_org_to_html_with_ctx(&buf, theme, Some(ctx), assets, static_files),
         other => return Err(anyhow!("unsupported extension {:?} for {}", other, path.display())),
     };
     Ok(html)
@@ -773,7 +1064,7 @@ fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx) -
 
 // removed legacy convert_markdown_to_html (replaced by convert_markdown_to_html_with_ctx)
 
-fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>) -> String {
+fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>, assets: &AssetConfig, static_files: Option<&mut BTreeSet<String>>) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
@@ -787,12 +1078,11 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
     let mut code_lang: Option<String> = None;
     let mut code_info = String::new();
     let mut code_buf = String::new();
-    let mut code_index = 0usize;
+    let mut code_occurrences: BTreeMap<String, usize> = BTreeMap::new();
     for ev in parser {
         match ev {
             Event::Start(Tag::CodeBlock(kind)) => {
                 in_code = true;
-                code_index += 1;
                 code_buf.clear();
                 code_lang = match kind {
                     CodeBlockKind::Fenced(info) => {
@@ -808,18 +1098,47 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
             }
             Event::Text(t) if in_code => { code_buf.push_str(&t); }
             Event::End(TagEnd::CodeBlock) => {
-                let mut html_snippet = highlight_code(&code_buf, code_lang.as_deref());
+                let (_, settings) = parse_fence_info(&code_info);
+                let is_result = settings.contains_key("haystack-result");
+                let mut html_snippet = if is_result {
+                    match code_lang.as_deref() {
+                        Some("markdown") => format!(
+                            r#"<div class="saved-code-result">{}</div>"#,
+                            render_markdown_fragment(&code_buf),
+                        ),
+                        Some("codex") => match render_codex_output(code_buf.as_bytes(), b"") {
+                            Ok(rendered) => {
+                                format!(r#"<div class="saved-code-result">{rendered}</div>"#)
+                            }
+                            Err(error) => format!(
+                                r#"<div class="saved-code-result codex-error">{}</div>"#,
+                                escape_html(&error.to_string()),
+                            ),
+                        },
+                        _ => highlight_code(&code_buf, code_lang.as_deref()),
+                    }
+                } else {
+                    highlight_code(&code_buf, code_lang.as_deref())
+                };
                 if let (Some(source), Some(lang)) =
                     (ctx.and_then(|c| c.exec_source.as_deref()), code_lang.as_deref())
                 {
                     let is_configured = ctx
                         .map(|c| c.exec_languages.iter().any(|configured| configured.eq_ignore_ascii_case(lang)))
                         .unwrap_or(false);
-                    if is_configured {
+                    if is_configured && !is_result {
+                        let fingerprint = block_fingerprint(lang, &code_buf);
+                        let occurrence = code_occurrences.entry(fingerprint.clone()).or_default();
+                        let temporary_id = format!("{fingerprint}-{}", *occurrence);
+                        *occurrence += 1;
+                        let block_id = settings
+                            .get("id")
+                            .map(String::as_str)
+                            .unwrap_or(&temporary_id);
                         html_snippet = executable_code_html(
                             &html_snippet,
                             source,
-                            &format!("code-{}", code_index),
+                            block_id,
                             &code_info,
                         );
                     }
@@ -836,12 +1155,19 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
     if let Some(c) = ctx { if let Some(cur) = c.current_lang.as_ref() { if Some(cur) != c.default_lang.as_ref() {
         body = rewrite_internal_links(&body, &format!("/{}/", cur));
     }}}
+    let page_dir = ctx.map(|c| c.page_dir.as_str()).unwrap_or("");
+    body = rewrite_asset_urls_maybe_collect(&body, assets, page_dir, static_files);
     let title = extract_title_from_markdown(input);
     wrap_html_page_with_ctx(body, title, theme, ctx)
 }
 
 fn render_markdown_fragment(input: &str) -> String {
-    let parser = MdParser::new_ext(input, Options::all());
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+    let parser = MdParser::new_ext(input, options);
     let mut events = Vec::new();
     let mut in_code = false;
     let mut code_lang: Option<String> = None;
@@ -981,7 +1307,7 @@ fn render_codex_output(stdout: &[u8], stderr: &[u8]) -> Result<String> {
 
 // removed legacy convert_org_to_html (replaced by convert_org_to_html_with_ctx)
 
-fn convert_org_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>) -> String {
+fn convert_org_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Option<&'a PageLangCtx>, assets: &AssetConfig, static_files: Option<&mut BTreeSet<String>>) -> String {
     let org = Org::parse(input);
     let mut bytes: Vec<u8> = Vec::new();
     let _ = org.write_html(&mut bytes);
@@ -991,6 +1317,8 @@ fn convert_org_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: Optio
     if let Some(c) = ctx { if let Some(cur) = c.current_lang.as_ref() { if Some(cur) != c.default_lang.as_ref() {
         body = rewrite_internal_links(&body, &format!("/{}/", cur));
     }}}
+    let page_dir = ctx.map(|c| c.page_dir.as_str()).unwrap_or("");
+    body = rewrite_asset_urls_maybe_collect(&body, assets, page_dir, static_files);
     wrap_html_page_with_ctx(body, title, theme, ctx)
 }
 
@@ -1005,6 +1333,152 @@ fn rewrite_internal_links(body_html: &str, prefix: &str) -> String {
         format!("href='{}{}'", prefix, &caps[1])
     });
     tmp.into_owned()
+}
+
+fn rewrite_asset_urls(body_html: &str, assets: &AssetConfig, page_dir: &str) -> String {
+    rewrite_asset_urls_maybe_collect(body_html, assets, page_dir, None)
+}
+
+fn rewrite_asset_urls_collect(body_html: &str, assets: &AssetConfig, page_dir: &str, static_files: &mut BTreeSet<String>) -> String {
+    rewrite_asset_urls_maybe_collect(body_html, assets, page_dir, Some(static_files))
+}
+
+fn rewrite_asset_urls_maybe_collect(body_html: &str, assets: &AssetConfig, page_dir: &str, mut static_files: Option<&mut BTreeSet<String>>) -> String {
+    let Some(prefix) = assets.prefix.as_deref() else {
+        return body_html.to_string();
+    };
+
+    static SRCSET_ATTR_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?is)\b(srcset)=(["'])([^"']*)["']"#).unwrap());
+    static URL_ATTR_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?is)\b(src|poster|href)=(["'])([^"']*)["']"#).unwrap());
+
+    let with_srcset = SRCSET_ATTR_RE.replace_all(body_html, |caps: &regex::Captures| {
+        let attr = caps.get(1).map(|m| m.as_str()).unwrap_or("srcset");
+        let quote = caps.get(2).map(|m| m.as_str()).unwrap_or("\"");
+        let value = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        format!("{attr}={quote}{}{quote}", rewrite_srcset(value, prefix, page_dir, static_files.as_deref_mut()))
+    });
+
+    URL_ATTR_RE.replace_all(&with_srcset, |caps: &regex::Captures| {
+        let attr = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let quote = caps.get(2).map(|m| m.as_str()).unwrap_or("\"");
+        let value = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+        let rewritten = rewrite_asset_url_value(attr, value, prefix, page_dir, static_files.as_deref_mut())
+            .unwrap_or_else(|| value.to_string());
+        format!("{attr}={quote}{rewritten}{quote}")
+    }).into_owned()
+}
+
+fn rewrite_srcset(value: &str, prefix: &str, page_dir: &str, mut static_files: Option<&mut BTreeSet<String>>) -> String {
+    value
+        .split(',')
+        .map(|candidate| {
+            let leading = candidate.len() - candidate.trim_start().len();
+            let trimmed_start = &candidate[leading..];
+            let trailing = trimmed_start.len() - trimmed_start.trim_end().len();
+            let core = &trimmed_start[..trimmed_start.len() - trailing];
+            let mut parts = core.splitn(2, char::is_whitespace);
+            let url = parts.next().unwrap_or("");
+            let descriptor = parts.next().unwrap_or("");
+            let rewritten = prefix_asset_url(url, prefix, page_dir, static_files.as_deref_mut()).unwrap_or_else(|| url.to_string());
+            format!(
+                "{}{}{}{}{}",
+                &candidate[..leading],
+                rewritten,
+                if descriptor.is_empty() { "" } else { " " },
+                descriptor,
+                &trimmed_start[trimmed_start.len() - trailing..],
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn rewrite_asset_url_value(attr: &str, value: &str, prefix: &str, page_dir: &str, static_files: Option<&mut BTreeSet<String>>) -> Option<String> {
+    if attr.eq_ignore_ascii_case("href") && !is_asset_like_url(value) {
+        return None;
+    }
+    prefix_asset_url(value, prefix, page_dir, static_files)
+}
+
+fn prefix_asset_url(value: &str, prefix: &str, page_dir: &str, static_files: Option<&mut BTreeSet<String>>) -> Option<String> {
+    if is_external_or_special_url(value) || value == "/" {
+        return None;
+    }
+    let (path_part, suffix) = split_url_path_suffix(value);
+    let site_path = if let Some(path) = path_part.strip_prefix('/') {
+        normalize_site_path("", path)?
+    } else {
+        normalize_site_path(page_dir, path_part)?
+    };
+    if site_path.is_empty() {
+        return None;
+    }
+    if let Some(static_files) = static_files {
+        static_files.insert(site_path.clone());
+    }
+    Some(format!("{prefix}/{site_path}{suffix}"))
+}
+
+fn is_external_or_special_url(value: &str) -> bool {
+    value.is_empty()
+        || value.starts_with("//")
+        || value.starts_with('#')
+        || value.starts_with("data:")
+        || value.starts_with("mailto:")
+        || value.starts_with("tel:")
+        || value.contains("://")
+}
+
+fn split_url_path_suffix(value: &str) -> (&str, &str) {
+    match value.find(['?', '#']) {
+        Some(index) => (&value[..index], &value[index..]),
+        None => (value, ""),
+    }
+}
+
+fn normalize_site_path(page_dir: &str, value: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for segment in page_dir.split('/').chain(value.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            segment => parts.push(segment),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn is_asset_like_url(value: &str) -> bool {
+    if is_external_or_special_url(value) || value == "/" {
+        return false;
+    }
+    let path = value.trim_start_matches('/');
+    if path.is_empty() {
+        return false;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let Some(ext) = Path::new(path).extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    !matches!(ext.to_ascii_lowercase().as_str(), "html" | "htm" | "md" | "org")
+}
+
+fn write_static_file_list(path: &Path, files: &BTreeSet<String>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let mut contents = files.iter().cloned().collect::<Vec<_>>().join("\n");
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    fs::write(path, contents).with_context(|| format!("writing static file list {}", path.display()))?;
+    println!("Wrote static file list -> {}", path.display());
+    Ok(())
 }
 
 fn render_index_for_paths(paths: &[std::path::PathBuf], theme: &ThemeConfig, title: &str, href_prefix: &str, lang_nav: Option<&str>) -> String {
@@ -1108,6 +1582,7 @@ struct PageLangCtx {
     default_lang: Option<String>,
     supported_langs: Vec<String>,
     page_tail_html: Option<String>,
+    page_dir: String,
     available_langs: Vec<String>,
     exec_source: Option<String>,
     exec_languages: Vec<String>,
@@ -1132,16 +1607,7 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
     if (/micromessenger/i.test(ua)) {
       document.documentElement.setAttribute('data-hide-share', '1');
     }
-    // MathJax v3: config and loader
-    window.MathJax = window.MathJax || {
-      tex: {
-        inlineMath: [['$', '$'], ['\\(', '\\)']],
-        displayMath: [['$$','$$'], ['\\[','\\]']],
-        processEscapes: true,
-        processEnvironments: true
-      },
-      options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
-    };
+    // MathJax v4: config and lazy loader
     window.haystackTypesetMath = function(root) {
       var content = root ? (root.textContent || '') : '';
       var maybeHasMath = /\\$[^\\$]+\\$|\\\\\(|\\\\\)|\\\\\[|\\\\\]|\\$\\$/m.test(content);
@@ -1153,10 +1619,26 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
         return;
       }
       if (document.getElementById('MathJax-script')) return;
+      window.MathJax = window.MathJax || {
+        tex: {
+          inlineMath: [['$', '$'], ['\\(', '\\)']],
+          displayMath: [['$$','$$'], ['\\[','\\]']],
+          processEscapes: true,
+          processEnvironments: true
+        },
+        startup: {
+          typeset: false,
+          ready: function() {
+            MathJax.startup.defaultReady();
+            window.haystackTypesetMath(document.body);
+          }
+        },
+        options: { skipHtmlTags: ['script','noscript','style','textarea','pre','code'] }
+      };
       var mj = document.createElement('script');
       mj.id = 'MathJax-script';
       mj.async = true;
-      mj.src = 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js';
+      mj.src = 'https://cdn.jsdelivr.net/npm/mathjax@4/es5/tex-chtml.js';
       document.head.appendChild(mj);
     };
     document.addEventListener('DOMContentLoaded', function(){
@@ -1265,7 +1747,7 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
     const cur = document.documentElement.getAttribute('data-theme')||'auto';
     const next = (cur==='light') ? 'dark' : (cur==='dark' ? 'auto' : 'light');
     setTheme(next);
-    try { if(window.MathJax && window.MathJax.typeset){ setTimeout(function(){ MathJax.typeset(); }, 0); } } catch(e){}
+    try { if(window.haystackTypesetMath){ setTimeout(function(){ window.haystackTypesetMath(document.body); }, 0); } } catch(e){}
   }); }
 })();"#;
     // Prepare syntect CSS for light/dark and auto (media-driven)
@@ -1419,12 +1901,17 @@ fn build_page_ctx(base_src: &Path, rel_root: &Path, rel_file: &Path, cfg: &LangC
     };
     let tail_html = rel_file.with_extension("html").to_string_lossy().replace('\\', "/");
     let tail_no_ext = rel_file.with_extension("").to_string_lossy().replace('\\', "/");
+    let page_dir = rel_root
+        .join(rel_file.parent().unwrap_or_else(|| Path::new("")))
+        .to_string_lossy()
+        .replace('\\', "/");
     let available = page_available_langs(base_src, &tail_no_ext, cfg);
     PageLangCtx {
         current_lang: current,
         default_lang: cfg.default.clone(),
         supported_langs: cfg.all_langs(),
         page_tail_html: Some(tail_html),
+        page_dir,
         available_langs: available,
         exec_source: None,
         exec_languages: Vec::new(),
@@ -1435,11 +1922,17 @@ fn build_runtime_page_ctx(src_dir: &Path, current_lang: &Option<String>, base_ta
     if !cfg.has_langs() { return None; }
     let available = page_available_langs(src_dir, base_tail_no_ext, cfg);
     let tail_html = format!("{}.html", base_tail_no_ext);
+    let page_dir = Path::new(&tail_html)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
     Some(PageLangCtx {
         current_lang: current_lang.clone().or_else(|| cfg.default.clone()),
         default_lang: cfg.default.clone(),
         supported_langs: cfg.all_langs(),
         page_tail_html: Some(tail_html),
+        page_dir,
         available_langs: available,
         exec_source: None,
         exec_languages: Vec::new(),
@@ -1757,6 +2250,12 @@ pre {
 }
 .codex-usage { margin-top: 1rem; font-size: 0.8rem; }
 .codex-stderr { margin-top: 1rem; }
+.saved-code-result {
+  margin: 1rem 0; padding: 0.9rem; border: 1px dashed var(--border);
+  border-radius: 6px; background: var(--code-bg);
+}
+.saved-code-result > :first-child { margin-top: 0; }
+.saved-code-result > :last-child { margin-bottom: 0; }
  code { background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 4px; }
  pre code { padding: 0; background: transparent; }
  table { width: 100%; border-collapse: collapse; margin: 1.2rem 0; }
@@ -1974,7 +2473,8 @@ mod tests {
     #[test]
     fn parses_code_block_language_code_and_settings_by_id() {
         let markdown = "```text\nskip\n```\n\n```python cwd=examples env.MODE=test flag\nprint('ok')\n```\n";
-        let block = markdown_code_block(markdown, "code-2").unwrap();
+        let id = format!("{}-0", block_fingerprint("python", "print('ok')\n"));
+        let block = markdown_code_block(markdown, &id).unwrap();
 
         assert_eq!(block.language, "python");
         assert_eq!(block.code, "print('ok')\n");
@@ -2029,11 +2529,11 @@ mod tests {
             ..PageLangCtx::default()
         };
         let with_execution =
-            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, Some(&enabled));
+            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, Some(&enabled), &AssetConfig::default(), None);
         let without_execution =
-            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, None);
+            convert_markdown_to_html_with_ctx("```python\nprint(1)\n```", &theme, None, &AssetConfig::default(), None);
 
-        assert!(with_execution.contains(r#"data-block-id="code-1""#));
+        assert!(with_execution.contains(r#"data-block-id="temp-"#));
         assert!(with_execution.contains(r#"class="run-code""#));
         assert!(with_execution.contains("haystackTypesetMath(output)"));
         assert!(!without_execution.contains(r#"class="run-code""#));
@@ -2063,5 +2563,184 @@ mod tests {
         assert!(html.contains("<h2>Done</h2>"));
         assert!(html.contains("25 uncached input · 75 cached input · 20 output tokens"));
         assert!(html.contains("Codex diagnostics"));
+    }
+
+    #[test]
+    fn rewrites_root_relative_asset_urls_only() {
+        let assets = AssetConfig::new(Some("https://assets.example.com/".to_string()));
+        let html = concat!(
+            r#"<img src="/images/a.png">"#,
+            r#"<audio src='/audio/theme.mp3'></audio>"#,
+            r#"<video poster="/posters/hero.jpg"></video>"#,
+            r#"<img srcset="/small.png 1x, /large.png 2x, https://cdn.example.com/x.png 3x">"#,
+            r#"<link href="/style.css" rel="stylesheet">"#,
+            r#"<a href="/guide.html">Guide</a>"#,
+            r#"<a href="/files/book.pdf">PDF</a>"#,
+            r#"<img src="//cdn.example.com/already.png">"#,
+        );
+
+        let rewritten = rewrite_asset_urls(html, &assets, "posts/2026");
+
+        assert!(rewritten.contains(r#"src="https://assets.example.com/images/a.png""#));
+        assert!(rewritten.contains(r#"src='https://assets.example.com/audio/theme.mp3'"#));
+        assert!(rewritten.contains(r#"poster="https://assets.example.com/posters/hero.jpg""#));
+        assert!(rewritten.contains(r#"srcset="https://assets.example.com/small.png 1x, https://assets.example.com/large.png 2x, https://cdn.example.com/x.png 3x""#));
+        assert!(rewritten.contains(r#"href="https://assets.example.com/style.css""#));
+        assert!(rewritten.contains(r#"<a href="/guide.html">Guide</a>"#));
+        assert!(rewritten.contains(r#"<a href="https://assets.example.com/files/book.pdf">PDF</a>"#));
+        assert!(rewritten.contains(r#"src="//cdn.example.com/already.png""#));
+    }
+
+    #[test]
+    fn rewrites_relative_asset_urls_from_page_directory() {
+        let assets = AssetConfig::new(Some("https://assets.example.com/".to_string()));
+        let html = concat!(
+            r#"<audio src="../audio/n2-aging-society.mp3?version=1"></audio>"#,
+            r#"<img src="./images/chart.png#v2">"#,
+            r#"<a href="../audio/transcript.pdf">Transcript</a>"#,
+        );
+        let mut files = BTreeSet::new();
+
+        let rewritten = rewrite_asset_urls_collect(html, &assets, "lessons/n2", &mut files);
+
+        assert!(rewritten.contains(r#"src="https://assets.example.com/lessons/audio/n2-aging-society.mp3?version=1""#));
+        assert!(rewritten.contains(r#"src="https://assets.example.com/lessons/n2/images/chart.png#v2""#));
+        assert!(rewritten.contains(r#"href="https://assets.example.com/lessons/audio/transcript.pdf""#));
+        assert!(files.contains("lessons/audio/n2-aging-society.mp3"));
+        assert!(files.contains("lessons/n2/images/chart.png"));
+        assert!(files.contains("lessons/audio/transcript.pdf"));
+    }
+
+    #[test]
+    fn build_writes_static_file_list() {
+        let root = std::env::temp_dir().join(format!(
+            "haystack-static-list-test-{}-{}",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let src = root.join("src");
+        let out = root.join("output");
+        fs::create_dir_all(src.join("audio")).unwrap();
+        fs::create_dir_all(src.join("posts")).unwrap();
+        fs::write(src.join("posts").join("index.md"), "# Home\n\n<audio src=\"../audio/theme.mp3\"></audio>\n").unwrap();
+        fs::write(src.join("audio").join("theme.mp3"), b"audio").unwrap();
+        fs::write(src.join("robots.txt"), "User-agent: *\n").unwrap();
+        let manifest = out.join("static-files.txt");
+
+        build_all(
+            &src,
+            &out,
+            &ThemeConfig::default(),
+            &LangConfig::default(),
+            false,
+            &AssetConfig::new(Some("https://assets.example.com".to_string())),
+            &manifest,
+        ).unwrap();
+
+        let page = fs::read_to_string(out.join("posts").join("index.html")).unwrap();
+        let list = fs::read_to_string(&manifest).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(page.contains(r#"src="https://assets.example.com/audio/theme.mp3""#));
+        assert_eq!(list, "audio/theme.mp3\n");
+    }
+
+    #[test]
+    fn assigns_stable_id_and_replaces_saved_text_result() {
+        let path = std::env::temp_dir().join(format!(
+            "haystack-result-test-{}-{}.md",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let original = "# Example\n\n```python\nprint(1)\n```\n\nAfter.\n";
+        fs::write(&path, original).unwrap();
+        let temporary_id = format!("{}-0", block_fingerprint("python", "print(1)\n"));
+        let block = markdown_code_block(original, &temporary_id).unwrap();
+        let stable_id = ensure_block_id(&path, original, &block).unwrap();
+        let save = ResultSave {
+            path: path.clone(),
+            block_id: stable_id.clone(),
+            executed_code: "print(1)\n".to_string(),
+            output_format: OutputFormat::Text,
+        };
+
+        save_result(&save, b"first\n").unwrap();
+        save_result(&save, b"second with ``` inside\n").unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert!(updated.contains(&format!("```python id={stable_id}")));
+        assert_eq!(updated.matches("<!-- haystack-result:").count(), 1);
+        assert!(!updated.contains("first"));
+        assert!(updated.contains("second with ``` inside"));
+        assert!(updated.contains("````text haystack-result="));
+        assert!(updated.contains("\nAfter.\n"));
+    }
+
+    #[test]
+    fn generated_block_ids_are_short() {
+        let id = generate_block_id();
+
+        assert_eq!(id.len(), 10);
+        assert!(id.starts_with("b-"));
+        assert!(id[2..].bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn saves_and_renders_markdown_results_inline() {
+        let path = std::env::temp_dir().join(format!(
+            "haystack-markdown-result-test-{}-{}.md",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let original = "```sh id=example\nprintf result\n```\n";
+        fs::write(&path, original).unwrap();
+        let save = ResultSave {
+            path: path.clone(),
+            block_id: "example".to_string(),
+            executed_code: "printf result\n".to_string(),
+            output_format: OutputFormat::Markdown,
+        };
+
+        save_result(&save, b"## Result\n\nValue: $x^2$\n").unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let rendered =
+            convert_markdown_to_html_with_ctx(&updated, &ThemeConfig::default(), None, &AssetConfig::default(), None);
+        let _ = fs::remove_file(&path);
+
+        assert!(updated.contains("```markdown haystack-result=example"));
+        assert!(rendered.contains(r#"<div class="saved-code-result"><h2>Result</h2>"#));
+        assert!(rendered.contains("Value: $x^2$"), "{rendered}");
+    }
+
+    #[test]
+    fn saves_and_renders_codex_results_inline() {
+        let path = std::env::temp_dir().join(format!(
+            "haystack-codex-result-test-{}-{}.md",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let original = "```codex id=agent\nAnswer briefly.\n```\n";
+        fs::write(&path, original).unwrap();
+        let save = ResultSave {
+            path: path.clone(),
+            block_id: "agent".to_string(),
+            executed_code: "Answer briefly.\n".to_string(),
+            output_format: OutputFormat::Codex,
+        };
+        let jsonl = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"## Answer\\n\\nDone.\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":40,\"cached_input_tokens\":30,\"output_tokens\":5}}\n",
+        );
+
+        save_result(&save, jsonl.as_bytes()).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        let rendered =
+            convert_markdown_to_html_with_ctx(&updated, &ThemeConfig::default(), None, &AssetConfig::default(), None);
+        let _ = fs::remove_file(&path);
+
+        assert!(updated.contains("```codex haystack-result=agent"));
+        assert!(rendered.contains("<h2>Answer</h2>"));
+        assert!(rendered.contains("10 uncached input · 30 cached input · 5 output tokens"));
     }
 }
