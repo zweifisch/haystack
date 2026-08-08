@@ -145,12 +145,30 @@ and trusted networks.
 
 - Markdown via `pulldown-cmark`
 - Org via `orgize`
+- Browser-rendered Graphviz DOT diagrams from fenced `dot`/`graphviz` code blocks
 - Responsive, minimal built-in CSS with dark-mode support
 - Built-in Share button to capture and share/download a screenshot of the page content
 - Dynamic HTML `<title>` from first heading/`#+TITLE`
 - Server-side code highlighting with `syntect` (no CDN)
 - Theme selection via `--theme-light` / `--theme-dark`
 - Static assets: copies non-`.md`/`.org` files from `src/` to `output/` during build, and serves them directly during `serve` with proper Content-Type.
+
+### Graphviz DOT diagrams
+
+Fenced `dot` and `graphviz` Markdown code blocks are rendered in the browser as
+SVG diagrams:
+
+````markdown
+```dot
+digraph {
+  rankdir=LR
+  A -> B
+}
+```
+````
+
+Diagram rendering loads Graphviz WebAssembly lazily in pages that contain DOT
+blocks, so pages without diagrams do not fetch it.
 
 ## Configuration
 

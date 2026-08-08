@@ -1061,6 +1061,20 @@ fn executable_code_html(highlighted: &str, source: &str, block_id: &str, info: &
     )
 }
 
+fn is_graphviz_dot_language(lang: Option<&str>) -> bool {
+    matches!(
+        lang.map(|value| value.to_ascii_lowercase()),
+        Some(value) if value == "dot" || value == "graphviz"
+    )
+}
+
+fn graphviz_dot_html(source: &str) -> String {
+    format!(
+        r#"<div class="graphviz-dot" data-graphviz-pending="1"><template class="graphviz-dot-source">{}</template><div class="graphviz-status">Rendering diagram...</div></div>"#,
+        escape_html(source),
+    )
+}
+
 // removed legacy convert_file (replaced by convert_file_with_lang)
 
 fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx, assets: &mut AssetConfig) -> Result<String> {
@@ -1133,6 +1147,8 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
                         },
                         _ => highlight_code(&code_buf, code_lang.as_deref()),
                     }
+                } else if is_graphviz_dot_language(code_lang.as_deref()) {
+                    graphviz_dot_html(&code_buf)
                 } else {
                     highlight_code(&code_buf, code_lang.as_deref())
                 };
@@ -1203,10 +1219,12 @@ fn render_markdown_fragment(input: &str) -> String {
             }
             Event::Text(text) if in_code => code_buf.push_str(&text),
             Event::End(TagEnd::CodeBlock) => {
-                events.push(Event::Html(CowStr::from(highlight_code(
-                    &code_buf,
-                    code_lang.as_deref(),
-                ))));
+                let html = if is_graphviz_dot_language(code_lang.as_deref()) {
+                    graphviz_dot_html(&code_buf)
+                } else {
+                    highlight_code(&code_buf, code_lang.as_deref())
+                };
+                events.push(Event::Html(CowStr::from(html)));
                 in_code = false;
                 code_lang = None;
             }
@@ -1915,6 +1933,48 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
     window.location.href = url;
   });
 })();"#;
+    let graphviz_script = r#"(function(){
+  var graphvizPromise = null;
+  function loadGraphviz(){
+    if(graphvizPromise) return graphvizPromise;
+    graphvizPromise = import('https://cdn.jsdelivr.net/npm/@hpcc-js/wasm-graphviz@1/dist/index.min.js')
+      .then(function(module){ return module.Graphviz.load(); });
+    return graphvizPromise;
+  }
+  function sourceFor(block){
+    var source = block.querySelector('.graphviz-dot-source');
+    if(!source) return '';
+    if(source.content) return source.content.textContent || '';
+    return source.textContent || '';
+  }
+  async function renderBlock(block){
+    if(block.getAttribute('data-graphviz-rendered') === '1') return;
+    block.setAttribute('data-graphviz-rendered', '1');
+    try {
+      var dot = sourceFor(block);
+      var graphviz = await loadGraphviz();
+      var svg = graphviz.dot(dot);
+      block.removeAttribute('data-graphviz-pending');
+      block.innerHTML = '<div class="graphviz-rendered">' + svg + '</div>';
+    } catch(error) {
+      block.removeAttribute('data-graphviz-pending');
+      block.classList.add('graphviz-error');
+      block.innerHTML = '<pre>' + String(error && error.message ? error.message : error)
+        .replace(/[&<>]/g, function(ch){ return ({'&':'&amp;','<':'&lt;','>':'&gt;'})[ch]; }) + '</pre>';
+    }
+  }
+  function renderAll(root){
+    var blocks = (root || document).querySelectorAll('.graphviz-dot');
+    if(!blocks.length) return;
+    blocks.forEach(function(block){ renderBlock(block); });
+  }
+  window.haystackRenderGraphviz = renderAll;
+  if(document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function(){ renderAll(document); });
+  } else {
+    renderAll(document);
+  }
+})();"#;
     let execution_script = r#"(function(){
   document.addEventListener('click', async function(event){
     var button = event.target.closest('.run-code');
@@ -1941,6 +2001,7 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
         output.classList.add('markdown-output');
         output.innerHTML = await response.text();
         if(window.haystackTypesetMath) window.haystackTypesetMath(output);
+        if(window.haystackRenderGraphviz) window.haystackRenderGraphviz(output);
         return;
       }
       if(!response.body) { output.textContent = await response.text(); return; }
@@ -1961,8 +2022,8 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
   });
 })();"#;
     format!(
-        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"auto\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
-        escape_attr(&html_lang), page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script, lang_switch_script, execution_script
+        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"auto\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
+        escape_attr(&html_lang), page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script, lang_switch_script, graphviz_script, execution_script
     )
 }
 
@@ -2379,6 +2440,35 @@ pre {
 }
 .saved-code-result > :first-child { margin-top: 0; }
 .saved-code-result > :last-child { margin-bottom: 0; }
+.graphviz-dot {
+  margin: 1rem 0;
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--code-bg) 60%, transparent);
+  overflow-x: auto;
+}
+.graphviz-dot[data-graphviz-pending='1'] {
+  color: var(--muted);
+  font: 0.9rem ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.graphviz-rendered {
+  min-width: min-content;
+}
+.graphviz-rendered svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+.graphviz-error {
+  border-style: dashed;
+  background: color-mix(in srgb, #b94a48 12%, var(--code-bg));
+}
+.graphviz-error pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
  code { background: var(--code-bg); padding: 0.1rem 0.35rem; border-radius: 4px; }
  pre code { padding: 0; background: transparent; }
  table { width: 100%; border-collapse: collapse; margin: 1.2rem 0; }
@@ -2689,6 +2779,33 @@ mod tests {
         assert!(fragment.contains("<li>one</li>"));
         assert!(fragment.contains("&lt;img"));
         assert!(!fragment.contains("<html"));
+    }
+
+    #[test]
+    fn renders_dot_code_blocks_as_graphviz_containers() {
+        let theme = ThemeConfig::default();
+        let mut assets = AssetConfig::default();
+        let rendered = convert_markdown_to_html_with_ctx(
+            "```dot\ndigraph { A -> B }\n```",
+            &theme,
+            None,
+            &mut assets,
+        ).unwrap();
+
+        assert!(rendered.contains(r#"class="graphviz-dot""#));
+        assert!(rendered.contains(r#"class="graphviz-dot-source""#));
+        assert!(rendered.contains("digraph { A -&gt; B }"));
+        assert!(rendered.contains("@hpcc-js/wasm-graphviz"));
+        assert!(!rendered.contains(r#"language-dot"#));
+    }
+
+    #[test]
+    fn renders_dot_code_blocks_in_markdown_fragments() {
+        let fragment = render_markdown_fragment("```graphviz\ngraph { A -- B }\n```");
+
+        assert!(fragment.contains(r#"class="graphviz-dot""#));
+        assert!(fragment.contains("graph { A -- B }"));
+        assert!(!fragment.contains(r#"language-graphviz"#));
     }
 
     #[test]
