@@ -208,6 +208,9 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
                 match path.extension().and_then(|s| s.to_str()) {
                     Some("md") | Some("org") => {
                         let rel = path.strip_prefix(&src_root).unwrap();
+                        if is_toc_path(rel) {
+                            continue;
+                        }
                         doc_paths.push(rel.to_path_buf());
                         let mut out_path = out_root.join(rel);
                         out_path.set_extension("html");
@@ -250,7 +253,8 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
         if generate_index {
             doc_paths.sort_by(|a, b| a.to_string_lossy().to_ascii_lowercase().cmp(&b.to_string_lossy().to_ascii_lowercase()));
             let nav = build_lang_index_nav(cfg, href_prefix);
-            let index_html = render_index_for_paths(&doc_paths, theme, "Index", href_prefix, nav.as_deref());
+            let ctx = build_page_ctx(base_src, rel_root, Path::new("index.md"), cfg);
+            let index_html = render_index_for_paths_with_ctx(&doc_paths, theme, "Index", href_prefix, nav.as_deref(), Some(&ctx));
             let index_path = out_root.join("index.html");
             fs::write(&index_path, index_html).with_context(|| format!("writing index {}", index_path.display()))?;
             println!("Built index -> {}", index_path.display());
@@ -272,6 +276,81 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
     Ok(())
 }
 
+fn render_runtime_page(
+    src_dir: &Path,
+    current_lang: Option<String>,
+    base_in: &str,
+    base_dir: &Path,
+    theme: &ThemeConfig,
+    lang_cfg: &LangConfig,
+    allow_exec: bool,
+    execution: &ExecutionConfig,
+    assets: &mut AssetConfig,
+) -> Option<Response<std::io::Cursor<Vec<u8>>>> {
+    let html_path = base_dir.join(format!("{}.html", base_in));
+    let md_path = base_dir.join(format!("{}.md", base_in));
+    let org_path = base_dir.join(format!("{}.org", base_in));
+
+    if html_path.exists() {
+        return match fs::read_to_string(&html_path) {
+            Ok(s) => {
+                let page_dir = current_lang
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+                    .join(Path::new(base_in).parent().unwrap_or_else(|| Path::new("")))
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                Some(match rewrite_asset_urls(&s, assets, &page_dir) {
+                    Ok(html) => Response::from_string(html)
+                        .with_status_code(200)
+                        .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+                    Err(error) => Response::from_string(error.to_string()).with_status_code(500),
+                })
+            }
+            Err(e) => Some(Response::from_string(format!("Error reading {}: {}", html_path.display(), e))
+                .with_status_code(500)),
+        };
+    }
+
+    if md_path.exists() {
+        let mut ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg, base_dir);
+        if allow_exec {
+            let source = match &current_lang {
+                Some(lang) => format!("{}/{}.md", lang, base_in),
+                None => format!("{}.md", base_in),
+            };
+            let ctx = ctx.get_or_insert_with(PageLangCtx::default);
+            ctx.exec_source = Some(source);
+            ctx.exec_languages = execution.languages();
+        }
+        return Some(match fs::read_to_string(&md_path)
+            .and_then(|s| convert_markdown_to_html_with_ctx(&s, theme, ctx.as_ref(), assets).map_err(|error| std::io::Error::other(error.to_string())))
+        {
+            Ok(html) => Response::from_string(html)
+                .with_status_code(200)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+            Err(e) => Response::from_string(format!("Error reading {}: {}", md_path.display(), e))
+                .with_status_code(500),
+        });
+    }
+
+    if org_path.exists() {
+        let ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg, base_dir);
+        return Some(match fs::read_to_string(&org_path)
+            .and_then(|s| convert_org_to_html_with_ctx(&s, theme, ctx.as_ref(), assets).map_err(|error| std::io::Error::other(error.to_string())))
+        {
+            Ok(html) => Response::from_string(html)
+                .with_status_code(200)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap()),
+            Err(e) => Response::from_string(format!("Error reading {}: {}", org_path.display(), e))
+                .with_status_code(500),
+        });
+    }
+
+    None
+}
+
 fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, allow_exec: bool, execution: &ExecutionConfig, assets: &mut AssetConfig) -> Result<()> {
     if !src_dir.exists() {
         return Err(anyhow!("src folder not found: {}", src_dir.display()));
@@ -289,9 +368,18 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
         }
         // Root route: default-language index
         if path.is_empty() {
-            let docs = collect_docs_under(src_dir, None, &lang_cfg.others);
-            let nav = build_lang_index_nav(lang_cfg, "");
-            let html = render_index_for_paths(&docs, theme, "Index", "", nav.as_deref());
+            let html = match render_runtime_page(src_dir, None, "index", src_dir, theme, lang_cfg, allow_exec, execution, assets) {
+                Some(response) => {
+                    let _ = request.respond(response);
+                    continue;
+                }
+                None => {
+                    let docs = collect_docs_under(src_dir, None, &lang_cfg.others);
+                    let nav = build_lang_index_nav(lang_cfg, "");
+                    let ctx = build_runtime_page_ctx(src_dir, &None, "index", lang_cfg, src_dir);
+                    render_index_for_paths_with_ctx(&docs, theme, "Index", "", nav.as_deref(), ctx.as_ref())
+                }
+            };
             let resp = Response::from_string(html)
                 .with_status_code(200)
                 .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap());
@@ -302,9 +390,20 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
         // Language-prefixed index: /<lang>/
         if let Some(first) = path.split('/').next() {
             if lang_cfg.others.iter().any(|l| l == first) && (path == first || path == format!("{}/", first)) {
-                let docs = collect_docs_under(&src_dir.join(first), None, &Vec::new());
-                let nav = build_lang_index_nav(lang_cfg, &format!("{}/", first));
-                let html = render_index_for_paths(&docs, theme, &format!("Index ({})", first), &format!("{}/", first), nav.as_deref());
+                let current_lang = Some(first.to_string());
+                let lang_src = src_dir.join(first);
+                let html = match render_runtime_page(src_dir, current_lang.clone(), "index", &lang_src, theme, lang_cfg, allow_exec, execution, assets) {
+                    Some(response) => {
+                        let _ = request.respond(response);
+                        continue;
+                    }
+                    None => {
+                        let docs = collect_docs_under(&lang_src, None, &Vec::new());
+                        let nav = build_lang_index_nav(lang_cfg, &format!("{}/", first));
+                        let ctx = build_runtime_page_ctx(src_dir, &current_lang, "index", lang_cfg, &lang_src);
+                        render_index_for_paths_with_ctx(&docs, theme, &format!("Index ({})", first), &format!("{}/", first), nav.as_deref(), ctx.as_ref())
+                    }
+                };
                 let resp = Response::from_string(html)
                     .with_status_code(200)
                     .with_header(Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap());
@@ -334,7 +433,19 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
         let is_html_route = path.ends_with(".html") || !has_ext;
 
         let resp = if is_html_route {
-            let base_in = if tail.ends_with(".html") { &tail[..tail.len() - ".html".len()] } else { tail.as_str() };
+            let base_in = if tail.ends_with(".html") {
+                tail[..tail.len() - ".html".len()].to_string()
+            } else if tail.ends_with('/') {
+                let dir = tail.trim_end_matches('/');
+                if dir.is_empty() { "index".to_string() } else { format!("{dir}/index") }
+            } else {
+                let base_dir = match &current_lang { Some(l) => src_dir.join(l), None => src_dir.to_path_buf() };
+                if base_dir.join(&tail).is_dir() {
+                    format!("{}/index", tail.trim_end_matches('/'))
+                } else {
+                    tail.clone()
+                }
+            };
             let base_dir = match &current_lang { Some(l) => src_dir.join(l), None => src_dir.to_path_buf() };
             let html_path = base_dir.join(format!("{}.html", base_in));
             let md_path = base_dir.join(format!("{}.md", base_in));
@@ -359,7 +470,7 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
                         .with_status_code(500),
                 }
             } else if md_path.exists() {
-                let mut ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg);
+                let mut ctx = build_runtime_page_ctx(src_dir, &current_lang, &base_in, lang_cfg, &base_dir);
                 if allow_exec {
                     let source = match &current_lang {
                         Some(lang) => format!("{}/{}.md", lang, base_in),
@@ -377,7 +488,7 @@ fn serve(port: u16, src_dir: &Path, theme: &ThemeConfig, lang_cfg: &LangConfig, 
                         .with_status_code(500),
                 }
             } else if org_path.exists() {
-                let ctx = build_runtime_page_ctx(src_dir, &current_lang, base_in, lang_cfg);
+                let ctx = build_runtime_page_ctx(src_dir, &current_lang, &base_in, lang_cfg, &base_dir);
                 match fs::read_to_string(&org_path).and_then(|s| convert_org_to_html_with_ctx(&s, theme, ctx.as_ref(), assets).map_err(|error| std::io::Error::other(error.to_string()))) {
                     Ok(html) => Response::from_string(html)
                         .with_status_code(200)
@@ -1622,7 +1733,7 @@ fn write_static_file_list(path: &Path, files: &BTreeMap<String, StaticAsset>) ->
     Ok(())
 }
 
-fn render_index_for_paths(paths: &[std::path::PathBuf], theme: &ThemeConfig, title: &str, href_prefix: &str, lang_nav: Option<&str>) -> String {
+fn render_index_for_paths_with_ctx(paths: &[std::path::PathBuf], theme: &ThemeConfig, title: &str, href_prefix: &str, lang_nav: Option<&str>, ctx: Option<&PageLangCtx>) -> String {
     // Build a nested directory tree and render as grouped lists
     #[derive(Default)]
     struct DirNode {
@@ -1677,6 +1788,9 @@ fn render_index_for_paths(paths: &[std::path::PathBuf], theme: &ThemeConfig, tit
 
     let mut root = DirNode::default();
     for rel in paths {
+        if is_toc_path(rel) {
+            continue;
+        }
         insert_path(&mut root, rel, rel);
     }
 
@@ -1708,7 +1822,132 @@ fn render_index_for_paths(paths: &[std::path::PathBuf], theme: &ThemeConfig, tit
   filter();
 })();</script>
 "#);
-    wrap_html_page(body, Some(title.to_string()), theme)
+    wrap_html_page_with_ctx(body, Some(title.to_string()), theme, ctx)
+}
+
+fn is_toc_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("TOC.md"))
+        .unwrap_or(false)
+}
+
+fn sidebar_for_page(source_root: &Path, route_prefix: &str, rel_file: &Path) -> Option<String> {
+    let page_dir = rel_file.parent().unwrap_or_else(|| Path::new(""));
+    let toc_rel = nearest_toc(source_root, page_dir)?;
+    let toc_path = source_root.join(&toc_rel);
+    let input = fs::read_to_string(&toc_path).ok()?;
+    let toc_dir = toc_rel.parent().unwrap_or_else(|| Path::new(""));
+    let page_href = toc_link_href(
+        route_prefix,
+        Path::new(""),
+        &rel_file.with_extension("html").to_string_lossy(),
+    );
+    let rendered = render_markdown_fragment(&input);
+    Some(rewrite_toc_links(&rendered, route_prefix, toc_dir, page_href.as_deref()))
+}
+
+fn nearest_toc(source_root: &Path, page_dir: &Path) -> Option<PathBuf> {
+    let mut current = page_dir.to_path_buf();
+    loop {
+        let candidate = current.join("TOC.md");
+        if source_root.join(&candidate).is_file() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn rewrite_toc_links(html: &str, route_prefix: &str, toc_dir: &Path, page_href: Option<&str>) -> String {
+    static HREF_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?is)\bhref=(["'])([^"']*)["']"#).unwrap());
+    let mut rewritten = String::new();
+    let mut last = 0;
+    for caps in HREF_RE.captures_iter(html) {
+        let matched = caps.get(0).unwrap();
+        rewritten.push_str(&html[last..matched.start()]);
+        let quote = caps.get(1).map(|m| m.as_str()).unwrap_or("\"");
+        let value = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        if let Some(href) = toc_link_href(route_prefix, toc_dir, value) {
+            let active = if page_href.map(|current| nav_hrefs_match(&href, current)).unwrap_or(false) { r#" class="active" aria-current="page""# } else { "" };
+            rewritten.push_str(&format!(r#"href={quote}{}{quote}{}"#, escape_attr(&href), active));
+        } else {
+            rewritten.push_str(matched.as_str());
+        }
+        last = matched.end();
+    }
+    rewritten.push_str(&html[last..]);
+    rewritten
+}
+
+fn toc_link_href(route_prefix: &str, toc_dir: &Path, value: &str) -> Option<String> {
+    if is_external_or_special_url(value) {
+        return None;
+    }
+    let (path_part, suffix) = split_url_path_suffix(value);
+    if path_part.is_empty() {
+        return None;
+    }
+    let route_prefix = route_prefix.trim_matches('/');
+    let site_path = if let Some(path) = path_part.strip_prefix('/') {
+        let normalized = normalize_site_path("", path)?;
+        if route_prefix.is_empty() || normalized.starts_with(&format!("{route_prefix}/")) || normalized == route_prefix {
+            normalized
+        } else {
+            normalize_site_path(route_prefix, &normalized)?
+        }
+    } else {
+        let base = toc_dir.to_string_lossy().replace('\\', "/");
+        let base = if route_prefix.is_empty() {
+            base
+        } else if base.is_empty() {
+            route_prefix.to_string()
+        } else {
+            format!("{route_prefix}/{base}")
+        };
+        normalize_site_path(&base, path_part)?
+    };
+    Some(format!("/{}{}", html_route_for_site_path(&site_path), suffix))
+}
+
+fn html_route_for_site_path(site_path: &str) -> String {
+    let path = Path::new(site_path);
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let mut html_path = if matches!(ext.to_ascii_lowercase().as_str(), "md" | "org") {
+        path.with_extension("html").to_string_lossy().replace('\\', "/")
+    } else {
+        site_path.replace('\\', "/")
+    };
+    if html_path == "index.html" {
+        return String::new();
+    }
+    if let Some(prefix) = html_path.strip_suffix("/index.html") {
+        html_path = format!("{prefix}/");
+    }
+    html_path
+}
+
+fn nav_hrefs_match(left: &str, right: &str) -> bool {
+    normalize_nav_href(left) == normalize_nav_href(right)
+}
+
+fn normalize_nav_href(value: &str) -> String {
+    let (path, _) = split_url_path_suffix(value);
+    let mut path = path.trim_end_matches('/').to_string();
+    if path.is_empty() {
+        return "/".to_string();
+    }
+    if let Some(prefix) = path.strip_suffix("/index.html") {
+        path = prefix.to_string();
+    } else if path == "/index.html" {
+        path = "/".to_string();
+    } else if let Some(prefix) = path.strip_suffix(".html") {
+        path = prefix.to_string();
+    }
+    if path.is_empty() { "/".to_string() } else { path }
 }
 
 fn escape_html(s: &str) -> String {
@@ -1725,12 +1964,9 @@ struct PageLangCtx {
     page_tail_html: Option<String>,
     page_dir: String,
     available_langs: Vec<String>,
+    sidebar_html: Option<String>,
     exec_source: Option<String>,
     exec_languages: Vec<String>,
-}
-
-fn wrap_html_page(body: String, title: Option<String>, theme: &ThemeConfig) -> String {
-    wrap_html_page_with_ctx(body, title, theme, None)
 }
 
 fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeConfig, ctx: Option<&PageLangCtx>) -> String {
@@ -2021,9 +2257,33 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
     }
   });
 })();"#;
+    let sidebar_script = r#"(function(){
+  function scrollActiveSidebarItem(){
+    var nav = document.querySelector('.sidebar-nav');
+    if(!nav || getComputedStyle(nav).display === 'none') return;
+    var active = nav.querySelector('a[aria-current="page"], a.active');
+    if(!active) return;
+    var target = active.offsetTop - (nav.clientHeight / 2) + (active.offsetHeight / 2);
+    nav.scrollTop = Math.max(0, target);
+  }
+  if(document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scrollActiveSidebarItem);
+  } else {
+    scrollActiveSidebarItem();
+  }
+})();"#;
+    let page_body = if let Some(sidebar) = ctx.and_then(|c| c.sidebar_html.as_deref()) {
+        format!(
+            r#"<div class="page-shell"><aside class="sidebar-nav" aria-label="Table of contents">{}</aside><main class="container">{}</main></div>"#,
+            sidebar,
+            body,
+        )
+    } else {
+        format!(r#"<main class="container">{}</main>"#, body)
+    };
     format!(
-        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"auto\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n<main class=\"container\">\n{}\n</main>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
-        escape_attr(&html_lang), page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, body, toggle_script, indicator_script, share_script, lang_switch_script, graphviz_script, execution_script
+        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"auto\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n{}\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
+        escape_attr(&html_lang), page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, page_body, toggle_script, indicator_script, share_script, lang_switch_script, graphviz_script, execution_script, sidebar_script
     )
 }
 
@@ -2047,9 +2307,14 @@ fn collect_docs_under(root: &Path, _ignore: Option<()>, exclude_first_level: &Ve
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                 if ext == "md" || ext == "org" || ext == "html" {
                     if let Ok(rel) = p.strip_prefix(root) {
+                        if is_toc_path(rel) {
+                            continue;
+                        }
                         // Exclude top-level language directories when scanning default root
                         if let Some(first) = rel.iter().next().and_then(|s| s.to_str()) {
-                            if exclude_first_level.iter().any(|x| x == first) { continue; }
+                            if exclude_first_level.iter().any(|x| x == first) {
+                                continue;
+                            }
                         }
                         docs.push(rel.to_path_buf());
                     }
@@ -2090,6 +2355,9 @@ fn build_page_ctx(base_src: &Path, rel_root: &Path, rel_file: &Path, cfg: &LangC
         .to_string_lossy()
         .replace('\\', "/");
     let available = page_available_langs(base_src, &tail_no_ext, cfg);
+    let source_root = base_src.join(rel_root);
+    let route_prefix = rel_root.to_string_lossy().replace('\\', "/");
+    let sidebar_html = sidebar_for_page(&source_root, &route_prefix, rel_file);
     PageLangCtx {
         current_lang: current,
         default_lang: cfg.default.clone(),
@@ -2097,20 +2365,29 @@ fn build_page_ctx(base_src: &Path, rel_root: &Path, rel_file: &Path, cfg: &LangC
         page_tail_html: Some(tail_html),
         page_dir,
         available_langs: available,
+        sidebar_html,
         exec_source: None,
         exec_languages: Vec::new(),
     }
 }
 
-fn build_runtime_page_ctx(src_dir: &Path, current_lang: &Option<String>, base_tail_no_ext: &str, cfg: &LangConfig) -> Option<PageLangCtx> {
-    if !cfg.has_langs() { return None; }
+fn build_runtime_page_ctx(src_dir: &Path, current_lang: &Option<String>, base_tail_no_ext: &str, cfg: &LangConfig, source_root: &Path) -> Option<PageLangCtx> {
     let available = page_available_langs(src_dir, base_tail_no_ext, cfg);
     let tail_html = format!("{}.html", base_tail_no_ext);
-    let page_dir = Path::new(&tail_html)
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
+    let route_prefix = current_lang.clone().unwrap_or_default();
+    let page_dir = Path::new(&route_prefix)
+        .join(
+            Path::new(&tail_html)
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+        )
         .to_string_lossy()
         .replace('\\', "/");
+    let rel_file = PathBuf::from(format!("{}.md", base_tail_no_ext));
+    let sidebar_html = sidebar_for_page(source_root, &route_prefix, &rel_file);
+    if !cfg.has_langs() && sidebar_html.is_none() {
+        return None;
+    }
     Some(PageLangCtx {
         current_lang: current_lang.clone().or_else(|| cfg.default.clone()),
         default_lang: cfg.default.clone(),
@@ -2118,6 +2395,7 @@ fn build_runtime_page_ctx(src_dir: &Path, current_lang: &Option<String>, base_ta
         page_tail_html: Some(tail_html),
         page_dir,
         available_langs: available,
+        sidebar_html,
         exec_source: None,
         exec_languages: Vec::new(),
     })
@@ -2284,6 +2562,8 @@ fn default_css() -> &'static str {
   --link: #2f6f6f; /* teal-ish retro */
   --border: #d9d4c7;
   --code-bg: #efe9d6;
+  --nav-active-bg: #ece4cc;
+  --nav-active-border: #cfc5aa;
   --shadow: rgba(0,0,0,0.04);
 }
 [data-theme='dark'] {
@@ -2293,6 +2573,8 @@ fn default_css() -> &'static str {
   --link: #7fd1b9;
   --border: #2a2c33;
   --code-bg: #151821;
+  --nav-active-bg: #1d211f;
+  --nav-active-border: #3a4540;
   --shadow: rgba(0,0,0,0.25);
 }
 @media (prefers-color-scheme: dark) {
@@ -2303,6 +2585,8 @@ fn default_css() -> &'static str {
     --link: #7fd1b9;
     --border: #2a2c33;
     --code-bg: #151821;
+    --nav-active-bg: #1d211f;
+    --nav-active-border: #3a4540;
     --shadow: rgba(0,0,0,0.25);
   }
 }
@@ -2316,6 +2600,77 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 .container { max-width: 90ch; margin: 0 auto; padding: 28px 18px 48px; }
+.page-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 90ch) minmax(0, 1fr);
+  column-gap: 28px;
+  margin: 0 auto;
+  padding: 0 18px;
+}
+.page-shell .container {
+  grid-column: 2;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+  padding: 28px 0 48px;
+}
+.sidebar-nav {
+  grid-column: 1;
+  justify-self: end;
+  align-self: start;
+  position: sticky;
+  top: 16px;
+  width: min(240px, 100%);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: 28px 0 48px;
+  color: var(--muted);
+  font-family: "Source Sans Variable", "Source Sans 3", Arial, sans-serif;
+  font-size: 0.92rem;
+  line-height: 1.35;
+}
+.sidebar-nav h1 {
+  margin: 0 0 0.8rem;
+  color: var(--fg);
+  font-size: 1rem;
+  letter-spacing: 0;
+}
+.sidebar-nav h2 {
+  margin: 1.1rem 0 0.35rem;
+  color: var(--fg);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.sidebar-nav h3, .sidebar-nav h4, .sidebar-nav h5, .sidebar-nav h6 {
+  margin: 0.8rem 0 0.3rem;
+  color: var(--fg);
+  font-size: 0.9rem;
+  letter-spacing: 0;
+}
+.sidebar-nav p { margin: 0.5rem 0; text-align: left; }
+.sidebar-nav ul, .sidebar-nav ol { list-style: none; margin: 0; padding-left: 0; }
+.sidebar-nav li { margin: 0.15rem 0; }
+.sidebar-nav a {
+  display: block;
+  padding: 0.18rem 0.45rem;
+  margin-left: -0.45rem;
+  border-radius: 4px;
+  color: inherit;
+  text-decoration: none;
+}
+.sidebar-nav a:hover {
+  color: var(--link);
+  background: color-mix(in srgb, var(--code-bg) 70%, transparent);
+}
+.sidebar-nav a.active,
+.sidebar-nav a[aria-current='page'] {
+  color: var(--fg);
+  background: var(--nav-active-bg);
+  box-shadow: inset 3px 0 0 var(--nav-active-border);
+  font-weight: 700;
+}
 
 .theme-controls { position: absolute; top: 0; right: 0; display: flex; justify-content: flex-end; padding: 10px 18px 0; }
 .theme-controls button {
@@ -2519,7 +2874,13 @@ pre {
  a.footnote-reference:hover > sup { color: var(--fg); }
  a.footnote-backref { margin-left: 0.3rem; text-decoration: none; font-size: 0.75em; color: var(--muted); }
  a.footnote-backref:hover { color: var(--fg); }
- @media (max-width: 600px) { body { font-size: 20px; } .container { padding: 0 22px 56px; } }
+ @media (hover: none), (pointer: coarse) {
+   body { font-size: 20px; }
+   .container { padding: 0 22px 56px; }
+   .page-shell { display: block; padding: 0 22px; }
+   .page-shell .container { padding: 0 0 56px; }
+   .sidebar-nav { display: none; }
+ }
  @media (min-width: 900px) { body { font-size: 19px; } .container { padding: 28px 22px 56px; } }
 "#
 }
@@ -2698,6 +3059,58 @@ mod tests {
             manifest,
             generated: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn rewrites_toc_links_to_site_routes() {
+        assert_eq!(
+            toc_link_href("", Path::new("guide"), "index.md").as_deref(),
+            Some("/guide/")
+        );
+        assert_eq!(
+            toc_link_href("", Path::new("guide"), "install.md#setup").as_deref(),
+            Some("/guide/install.html#setup")
+        );
+        assert_eq!(
+            toc_link_href("zh", Path::new("guide"), "install.org").as_deref(),
+            Some("/zh/guide/install.html")
+        );
+        assert_eq!(
+            toc_link_href("zh", Path::new("guide"), "/reference.md").as_deref(),
+            Some("/zh/reference.html")
+        );
+        assert!(toc_link_href("", Path::new("guide"), "https://example.com").is_none());
+        assert!(nav_hrefs_match("/guide/install", "/guide/install.html"));
+        assert!(nav_hrefs_match("/guide/", "/guide/index.html"));
+    }
+
+    #[test]
+    fn sidebar_uses_nearest_toc_and_sections() {
+        let root = std::env::temp_dir().join(format!(
+            "haystack-sidebar-test-{}-{}",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let src = root.join("src");
+        fs::create_dir_all(src.join("guide").join("deep")).unwrap();
+        fs::write(src.join("guide").join("TOC.md"), "# Parent\n\n- [Parent](index.md)\n").unwrap();
+        fs::write(
+            src.join("guide").join("deep").join("TOC.md"),
+            "# Deep\n\n## Basics\n\n- [Overview](index.md)\n- [Page](page.md)\n",
+        ).unwrap();
+
+        let sidebar = sidebar_for_page(
+            &src,
+            "",
+            Path::new("guide/deep/page.md"),
+        ).unwrap();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(sidebar.contains("<h1>Deep</h1>"));
+        assert!(sidebar.contains("<h2>Basics</h2>"));
+        assert!(sidebar.contains(r#"href="/guide/deep/""#));
+        assert!(sidebar.contains(r#"href="/guide/deep/page.html" class="active" aria-current="page""#));
+        assert!(!sidebar.contains("Parent"));
     }
 
     #[test]
@@ -2919,6 +3332,51 @@ mod tests {
 
         assert!(page.contains(&format!(r#"src="https://assets.example.com/{expected_key}""#)));
         assert_eq!(list, format!("audio/theme.mp3\t{expected_key}\t{hash}\n"));
+    }
+
+    #[test]
+    fn build_renders_sidebar_from_toc_without_emitting_toc_page() {
+        let root = std::env::temp_dir().join(format!(
+            "haystack-toc-build-test-{}-{}",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let src = root.join("src");
+        let out = root.join("output");
+        fs::create_dir_all(src.join("guide")).unwrap();
+        fs::write(
+            src.join("guide").join("TOC.md"),
+            "# Guide\n\n## Start\n\n- [Overview](index.md)\n- [Install](install.md)\n",
+        ).unwrap();
+        fs::write(src.join("guide").join("index.md"), "# Overview\n").unwrap();
+        fs::write(src.join("guide").join("install.md"), "# Install\n").unwrap();
+        let manifest = root.join("static-files.txt");
+        let mut assets = AssetConfig::new(None, &src, &manifest).unwrap();
+
+        build_all(
+            &src,
+            &out,
+            &ThemeConfig::default(),
+            &LangConfig::default(),
+            true,
+            &mut assets,
+            &manifest,
+        ).unwrap();
+
+        let overview = fs::read_to_string(out.join("guide").join("index.html")).unwrap();
+        let install = fs::read_to_string(out.join("guide").join("install.html")).unwrap();
+        let generated_index = fs::read_to_string(out.join("index.html")).unwrap();
+        let toc_output_exists = out.join("guide").join("TOC.html").exists();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(!toc_output_exists);
+        assert!(overview.contains(r#"<aside class="sidebar-nav""#));
+        assert!(overview.contains("<h1>Guide</h1>"));
+        assert!(overview.contains("<h2>Start</h2>"));
+        assert!(overview.contains(r#"href="/guide/" class="active" aria-current="page""#));
+        assert!(overview.contains("scrollActiveSidebarItem"));
+        assert!(install.contains(r#"href="/guide/install.html" class="active" aria-current="page""#));
+        assert!(!generated_index.contains("TOC"));
     }
 
     #[test]

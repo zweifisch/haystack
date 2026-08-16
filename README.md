@@ -72,6 +72,29 @@ haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME] [--langs COD
 - With languages: `/<lang>/...` resolves within `src/<lang>/...` and `/<lang>/` serves that language’s index.
  - Pages include a language switcher when languages are configured.
 
+### Sidebar navigation
+
+Add a `TOC.md` file to any source directory to render it as sidebar navigation
+for pages in that directory tree. The nearest ancestor `TOC.md` wins, so nested
+directories can override parent navigation.
+
+```markdown
+# Guide
+
+## Basics
+
+- [Overview](index.md)
+- [Install](install.md)
+- [Configuration](config.md#options)
+```
+
+- `#` headings render as sidebar titles.
+- `##` headings render as section labels.
+- Links to `.md` and `.org` files are rewritten to `.html` routes.
+- Links to `index.md` or `index.org` are rewritten to the directory route.
+- `TOC.md` is not rendered as a page and is not listed in generated indexes.
+- `index.md` remains the directory content page when present.
+
 ### Executable Markdown code blocks
 
 Pass `--allow-exec` in serve mode to add a **Run** button to supported fenced
