@@ -29,10 +29,11 @@ cargo build --locked --release --target aarch64-apple-darwin
 ### Build site to `output/`:
 
 ```sh
-haystack build [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES] [--asset-prefix URL] [--static-file-list PATH]
+haystack build [--theme THEME] [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES] [--asset-prefix URL] [--static-file-list PATH]
 ```
 
 - Scans `src/` for `*.md` and `*.org` (recursively).
+- Skips `node_modules/` directories at every depth, including their documents and static files. Serve's generated indexes also exclude these directories.
 - Writes corresponding `*.html` into `output/`, preserving subdirectories.
 - Writes `static-files.txt` with tab-separated `source`, hashed object `key`,
   and content `hash` columns for prefixed asset references.
@@ -48,8 +49,11 @@ haystack build [--theme-light NAME] [--theme-dark NAME] [--index] [--langs CODES
 
 ```sh
 haystack build --asset-prefix https://assets.example.com
-scripts/upload-static-files-to-r2.sh --remote my-bucket
+scripts/upload-static-files-to-r2.sh --remote --skip-existing my-bucket
 ```
+
+Because asset keys include a content hash, `--skip-existing` avoids uploading
+files that are already present in R2 under the same hashed key.
 
 For CI builds where ignored assets are unavailable, commit a generated manifest
 and pass it back as the static file list:
@@ -64,7 +68,7 @@ prints a warning and leaves that URL unchanged.
 ### Serve on-demand HTML from `src/`:
 
 ```sh
-haystack serve --port 4000 [--theme-light NAME] [--theme-dark NAME] [--langs CODES] [--allow-exec] [--asset-prefix URL]
+haystack serve --port 4000 [--theme THEME] [--theme-light NAME] [--theme-dark NAME] [--langs CODES] [--allow-exec] [--asset-prefix URL]
 ```
 
 - Request `/<path>.html` → serves `src/<path>.md` or `src/<path>.org` rendered to HTML (default language, unprefixed).
@@ -168,12 +172,13 @@ and trusted networks.
 
 - Markdown via `pulldown-cmark`
 - Org via `orgize`
-- Browser-rendered Graphviz DOT diagrams from fenced `dot`/`graphviz` code blocks
+- Browser-rendered Graphviz DOT and Mermaid diagrams from fenced code blocks
+- Built-in automatic, light, dark, and named page color themes
 - Responsive, minimal built-in CSS with dark-mode support
 - Built-in Share button to capture and share/download a screenshot of the page content
 - Dynamic HTML `<title>` from first heading/`#+TITLE`
 - Server-side code highlighting with `syntect` (no CDN)
-- Theme selection via `--theme-light` / `--theme-dark`
+- Independent syntax-theme selection via `--theme-light` / `--theme-dark`
 - Static assets: copies non-`.md`/`.org` files from `src/` to `output/` during build, and serves them directly during `serve` with proper Content-Type.
 
 ### Graphviz DOT diagrams
@@ -193,9 +198,49 @@ digraph {
 Diagram rendering loads Graphviz WebAssembly lazily in pages that contain DOT
 blocks, so pages without diagrams do not fetch it.
 
+### Mermaid diagrams
+
+Fenced `mermaid` Markdown code blocks are rendered in the browser as SVG
+diagrams:
+
+````markdown
+```mermaid
+sequenceDiagram
+    Alice->>Bob: Hello Bob, how are you?
+    Bob-->>Alice: I am good, thanks!
+```
+````
+
+Mermaid is loaded lazily only when a page contains a Mermaid diagram. Diagrams
+use strict security mode and are redrawn when the page theme changes.
+
 ## Configuration
 
-- Choose highlighting themes from syntect's default set, e.g.:
+### Built-in page themes
+
+Choose a page palette with `-t, --theme` (default: `auto`):
+
+- `auto` / `system` — Haystack's original palette, following the system color scheme
+- `minimal`, `light`, and `dark` — clean neutral palette in automatic or fixed starting modes
+- `github`, `github-light`, `github-dark`
+- `solarized`, `solarized-light`, `solarized-dark`
+- `gruvbox`, `gruvbox-light`, `gruvbox-dark`
+- `catppuccin`, `catppuccin-latte`, `catppuccin-mocha`
+- `sepia`, `paper`, `nord`, `dracula`, `high-contrast` / `contrast`, and `slate`
+
+Paired themes without a light/dark suffix start in automatic mode. Fixed variants
+choose their named mode initially. The page theme button can still switch among
+Auto, Light, and Dark, and Mermaid diagrams follow the active mode.
+
+```sh
+haystack serve --theme solarized --port 4000
+haystack build --theme catppuccin-mocha
+```
+
+### Syntax highlighting themes
+
+Choose highlighting themes independently from syntect's built-in set:
+
   - Light: `InspiredGitHub`, `base16-ocean.light`, `Solarized (light)`
   - Dark: `base16-ocean.dark`, `Solarized (dark)`
 - Example:
@@ -210,7 +255,8 @@ haystack serve --port 4000 --theme-light "InspiredGitHub" --theme-dark "Solarize
 haystack themes
 ```
 
-Prints all theme names available in syntect’s default theme set.
+Prints built-in page themes followed by syntax-highlighting themes available
+from syntect.
 
 ### Custom head include
 

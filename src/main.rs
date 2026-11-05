@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser as MdParser, Tag, TagEnd};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use walkdir::WalkDir;
@@ -32,6 +32,9 @@ struct Cli {
 enum Commands {
     /// Compile src/*.md and src/*.org to output/*.html
     Build {
+        /// Built-in page color theme
+        #[arg(short = 't', long, value_enum, default_value_t = PageTheme::Auto)]
+        theme: PageTheme,
         /// Light theme name for syntax highlighting (syntect)
         #[arg(long, value_name = "NAME")]
         theme_light: Option<String>,
@@ -56,6 +59,9 @@ enum Commands {
         /// Port to listen on
         #[arg(long, default_value_t = 4000)]
         port: u16,
+        /// Built-in page color theme
+        #[arg(short = 't', long, value_enum, default_value_t = PageTheme::Auto)]
+        theme: PageTheme,
         /// Light theme name for syntax highlighting (syntect)
         #[arg(long, value_name = "NAME")]
         theme_light: Option<String>,
@@ -72,12 +78,100 @@ enum Commands {
         #[arg(long, value_name = "URL")]
         asset_prefix: Option<String>,
     },
-    /// List available syntax highlighting themes
+    /// List built-in page and syntax-highlighting themes
     Themes,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PageTheme {
+    #[default]
+    #[value(alias = "system")]
+    Auto,
+    Minimal,
+    Light,
+    Dark,
+    Solarized,
+    #[value(alias = "sol-light")]
+    SolarizedLight,
+    #[value(alias = "sol-dark")]
+    SolarizedDark,
+    Sepia,
+    Github,
+    GithubLight,
+    GithubDark,
+    Nord,
+    Dracula,
+    Gruvbox,
+    GruvboxLight,
+    GruvboxDark,
+    Catppuccin,
+    CatppuccinLatte,
+    CatppuccinMocha,
+    #[value(alias = "contrast")]
+    HighContrast,
+    Paper,
+    Slate,
+}
+
+impl PageTheme {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Minimal => "minimal",
+            Self::Light => "light",
+            Self::Dark => "dark",
+            Self::Solarized => "solarized",
+            Self::SolarizedLight => "solarized-light",
+            Self::SolarizedDark => "solarized-dark",
+            Self::Sepia => "sepia",
+            Self::Github => "github",
+            Self::GithubLight => "github-light",
+            Self::GithubDark => "github-dark",
+            Self::Nord => "nord",
+            Self::Dracula => "dracula",
+            Self::Gruvbox => "gruvbox",
+            Self::GruvboxLight => "gruvbox-light",
+            Self::GruvboxDark => "gruvbox-dark",
+            Self::Catppuccin => "catppuccin",
+            Self::CatppuccinLatte => "catppuccin-latte",
+            Self::CatppuccinMocha => "catppuccin-mocha",
+            Self::HighContrast => "high-contrast",
+            Self::Paper => "paper",
+            Self::Slate => "slate",
+        }
+    }
+
+    fn initial_mode(self) -> &'static str {
+        match self {
+            Self::Light
+            | Self::SolarizedLight
+            | Self::Sepia
+            | Self::GithubLight
+            | Self::GruvboxLight
+            | Self::CatppuccinLatte
+            | Self::Paper => "light",
+            Self::Dark
+            | Self::SolarizedDark
+            | Self::GithubDark
+            | Self::Nord
+            | Self::Dracula
+            | Self::GruvboxDark
+            | Self::CatppuccinMocha
+            | Self::HighContrast
+            | Self::Slate => "dark",
+            Self::Auto
+            | Self::Minimal
+            | Self::Solarized
+            | Self::Github
+            | Self::Gruvbox
+            | Self::Catppuccin => "auto",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct ThemeConfig {
+    page: PageTheme,
     light: Option<String>,
     dark: Option<String>,
 }
@@ -157,17 +251,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { theme_light, theme_dark, index, langs, asset_prefix, static_file_list } => {
+        Commands::Build { theme, theme_light, theme_dark, index, langs, asset_prefix, static_file_list } => {
             let src = Path::new("src");
             let out = Path::new("output");
-            let theme = ThemeConfig { light: theme_light, dark: theme_dark };
+            let theme = ThemeConfig { page: theme, light: theme_light, dark: theme_dark };
             let lang = LangConfig::new(langs);
             let mut assets = AssetConfig::new(asset_prefix, src, &static_file_list)?;
             build_all(src, out, &theme, &lang, index, &mut assets, &static_file_list)?;
         }
-        Commands::Serve { port, theme_light, theme_dark, langs, allow_exec, asset_prefix } => {
+        Commands::Serve { port, theme, theme_light, theme_dark, langs, allow_exec, asset_prefix } => {
             let src = Path::new("src");
-            let theme = ThemeConfig { light: theme_light, dark: theme_dark };
+            let theme = ThemeConfig { page: theme, light: theme_light, dark: theme_dark };
             let lang = LangConfig::new(langs);
             let mut assets = AssetConfig::new(asset_prefix, src, Path::new("static-files.txt"))?;
             let execution = ExecutionConfig::load()?;
@@ -202,7 +296,7 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
         fs::create_dir_all(&out_root)?;
 
         let mut doc_paths: Vec<std::path::PathBuf> = Vec::new();
-        for entry in WalkDir::new(&src_root).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&src_root).into_iter().filter_entry(include_source_entry).filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.is_file() {
                 match path.extension().and_then(|s| s.to_str()) {
@@ -1186,6 +1280,20 @@ fn graphviz_dot_html(source: &str) -> String {
     )
 }
 
+fn is_mermaid_language(lang: Option<&str>) -> bool {
+    matches!(
+        lang.map(|value| value.to_ascii_lowercase()),
+        Some(value) if value == "mermaid"
+    )
+}
+
+fn mermaid_html(source: &str) -> String {
+    format!(
+        r#"<div class="mermaid-diagram" data-mermaid-pending="1"><template class="mermaid-source">{}</template><div class="mermaid-status">Rendering diagram...</div><div class="mermaid-rendered"></div></div>"#,
+        escape_html(source),
+    )
+}
+
 // removed legacy convert_file (replaced by convert_file_with_lang)
 
 fn convert_file_with_lang(path: &Path, theme: &ThemeConfig, ctx: &PageLangCtx, assets: &mut AssetConfig) -> Result<String> {
@@ -1260,6 +1368,8 @@ fn convert_markdown_to_html_with_ctx<'a>(input: &str, theme: &ThemeConfig, ctx: 
                     }
                 } else if is_graphviz_dot_language(code_lang.as_deref()) {
                     graphviz_dot_html(&code_buf)
+                } else if is_mermaid_language(code_lang.as_deref()) {
+                    mermaid_html(&code_buf)
                 } else {
                     highlight_code(&code_buf, code_lang.as_deref())
                 };
@@ -1332,6 +1442,8 @@ fn render_markdown_fragment(input: &str) -> String {
             Event::End(TagEnd::CodeBlock) => {
                 let html = if is_graphviz_dot_language(code_lang.as_deref()) {
                     graphviz_dot_html(&code_buf)
+                } else if is_mermaid_language(code_lang.as_deref()) {
+                    mermaid_html(&code_buf)
                 } else {
                     highlight_code(&code_buf, code_lang.as_deref())
                 };
@@ -1971,6 +2083,7 @@ struct PageLangCtx {
 
 fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeConfig, ctx: Option<&PageLangCtx>) -> String {
     let css = default_css();
+    let page_theme_css = page_theme_css(theme.page);
     let (syn_css_light, syn_css_dark) = syntax_css(theme.light.as_deref(), theme.dark.as_deref());
     let page_title = title.as_deref().unwrap_or("haystack");
     let html_lang = ctx
@@ -1979,7 +2092,7 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
     let theme_bootstrap = r#"(function(){
   try {
     // Ensure initial theme attribute BEFORE CSS
-    document.documentElement.setAttribute('data-theme', localStorage.getItem('haystack-theme') || 'auto');
+    document.documentElement.setAttribute('data-theme', localStorage.getItem('haystack-theme') || '__HAYSTACK_DEFAULT_THEME__');
     var ua = navigator.userAgent || '';
     if (/micromessenger/i.test(ua)) {
       document.documentElement.setAttribute('data-hide-share', '1');
@@ -2022,7 +2135,7 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
       window.haystackTypesetMath(document.body);
     });
   } catch(e) {}
-})();"#;
+})();"#.replace("__HAYSTACK_DEFAULT_THEME__", theme.page.initial_mode());
     let share_script = r#"(function(){
   function loadHtml2Canvas(){
     return new Promise(function(resolve, reject){
@@ -2211,6 +2324,97 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
     renderAll(document);
   }
 })();"#;
+    let mermaid_script = r#"(function(){
+  var mermaidPromise = null;
+  var renderQueue = Promise.resolve();
+  var renderId = 0;
+  function loadMermaid(){
+    if(mermaidPromise) return mermaidPromise;
+    mermaidPromise = import('https://cdn.jsdelivr.net/npm/mermaid@12/dist/mermaid.esm.min.mjs')
+      .then(function(module){ return module.default; });
+    return mermaidPromise;
+  }
+  function sourceFor(block){
+    var source = block.querySelector('.mermaid-source');
+    if(!source) return '';
+    if(source.content) return source.content.textContent || '';
+    return source.textContent || '';
+  }
+  function currentTheme(){
+    var mode = document.documentElement.getAttribute('data-theme') || 'auto';
+    if(mode === 'dark') return 'dark';
+    if(mode === 'light') return 'default';
+    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+      ? 'dark' : 'default';
+  }
+  async function renderBlock(mermaid, block, force){
+    var theme = currentTheme();
+    if(!force && block.getAttribute('data-mermaid-theme') === theme) return;
+    var output = block.querySelector('.mermaid-rendered');
+    var status = block.querySelector('.mermaid-status');
+    if(!output) return;
+    block.setAttribute('data-mermaid-pending', '1');
+    block.classList.remove('mermaid-error');
+    if(status) status.hidden = false;
+    output.replaceChildren();
+    try {
+      var result = await mermaid.render('haystack-mermaid-' + (++renderId), sourceFor(block));
+      output.innerHTML = result.svg;
+      if(result.bindFunctions) result.bindFunctions(output);
+      block.setAttribute('data-mermaid-theme', theme);
+      block.removeAttribute('data-mermaid-pending');
+      if(status) status.hidden = true;
+    } catch(error) {
+      block.removeAttribute('data-mermaid-pending');
+      block.classList.add('mermaid-error');
+      output.textContent = String(error && error.message ? error.message : error);
+      if(status) status.hidden = true;
+    }
+  }
+  function renderAll(root, force){
+    var blocks = Array.from((root || document).querySelectorAll('.mermaid-diagram'));
+    if(!blocks.length) return renderQueue;
+    renderQueue = renderQueue.then(async function(){
+      var mermaid = await loadMermaid();
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        theme: currentTheme()
+      });
+      for(var i = 0; i < blocks.length; i++) await renderBlock(mermaid, blocks[i], force);
+    }).catch(function(error){
+      console.error('Mermaid rendering failed', error);
+      blocks.forEach(function(block){
+        var output = block.querySelector('.mermaid-rendered');
+        var status = block.querySelector('.mermaid-status');
+        block.removeAttribute('data-mermaid-pending');
+        block.classList.add('mermaid-error');
+        if(output) output.textContent = String(error && error.message ? error.message : error);
+        if(status) status.hidden = true;
+      });
+    });
+    return renderQueue;
+  }
+  window.haystackRenderMermaid = function(root){ return renderAll(root, false); };
+  function renderDocument(){ renderAll(document, false); }
+  if(document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', renderDocument);
+  } else {
+    renderDocument();
+  }
+  var themeButton = document.getElementById('themeToggle');
+  if(themeButton) themeButton.addEventListener('click', function(){
+    setTimeout(function(){ renderAll(document, true); }, 0);
+  });
+  if(window.matchMedia) {
+    var colorScheme = window.matchMedia('(prefers-color-scheme: dark)');
+    if(colorScheme.addEventListener) colorScheme.addEventListener('change', function(){
+      if((document.documentElement.getAttribute('data-theme') || 'auto') === 'auto') {
+        renderAll(document, true);
+      }
+    });
+  }
+})();"#;
     let execution_script = r#"(function(){
   document.addEventListener('click', async function(event){
     var button = event.target.closest('.run-code');
@@ -2238,6 +2442,7 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
         output.innerHTML = await response.text();
         if(window.haystackTypesetMath) window.haystackTypesetMath(output);
         if(window.haystackRenderGraphviz) window.haystackRenderGraphviz(output);
+        if(window.haystackRenderMermaid) window.haystackRenderMermaid(output);
         return;
       }
       if(!response.body) { output.textContent = await response.text(); return; }
@@ -2282,8 +2487,8 @@ fn wrap_html_page_with_ctx(body: String, title: Option<String>, theme: &ThemeCon
         format!(r#"<main class="container">{}</main>"#, body)
     };
     format!(
-        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"auto\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n{}\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
-        escape_attr(&html_lang), page_title, fonts_head, theme_bootstrap, css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, page_body, toggle_script, indicator_script, share_script, lang_switch_script, graphviz_script, execution_script, sidebar_script
+        "<!DOCTYPE html>\n<html lang=\"{}\" data-theme=\"{}\" data-page-theme=\"{}\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{}</title>\n{}\n<script>{}</script>\n<style>\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n</style>\n{}\n</head>\n<body>\n{}\n{}\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n<script>{}</script>\n</body>\n</html>",
+        escape_attr(&html_lang), theme.page.initial_mode(), theme.page.name(), page_title, fonts_head, theme_bootstrap, css, page_theme_css, syn_light_scoped, syn_dark_scoped, syn_auto_light, syn_auto_dark, wrap_overrides, head_extra, controls_html, page_body, toggle_script, indicator_script, share_script, lang_switch_script, graphviz_script, mermaid_script, execution_script, sidebar_script
     )
 }
 
@@ -2299,9 +2504,13 @@ fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;")
 }
 
+fn include_source_entry(entry: &walkdir::DirEntry) -> bool {
+    !(entry.file_type().is_dir() && entry.file_name() == "node_modules")
+}
+
 fn collect_docs_under(root: &Path, _ignore: Option<()>, exclude_first_level: &Vec<String>) -> Vec<std::path::PathBuf> {
     let mut docs = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(root).into_iter().filter_entry(include_source_entry).filter_map(|e| e.ok()) {
         let p = entry.path();
         if p.is_file() {
             if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
@@ -2554,43 +2763,74 @@ fn extract_title_from_org(input: &str) -> Option<String> {
     None
 }
 
+#[derive(Clone, Copy)]
+struct PagePalette {
+    fg: &'static str,
+    bg: &'static str,
+    muted: &'static str,
+    link: &'static str,
+    border: &'static str,
+    code_bg: &'static str,
+    nav_bg: &'static str,
+    nav_border: &'static str,
+    shadow: &'static str,
+}
+
+const HAYSTACK_LIGHT: PagePalette = PagePalette { fg: "#222222", bg: "#f7f4e9", muted: "#6b665e", link: "#2f6f6f", border: "#d9d4c7", code_bg: "#efe9d6", nav_bg: "#ece4cc", nav_border: "#cfc5aa", shadow: "rgba(0,0,0,0.04)" };
+const HAYSTACK_DARK: PagePalette = PagePalette { fg: "#e6e1cf", bg: "#0e0f13", muted: "#9a968a", link: "#7fd1b9", border: "#2a2c33", code_bg: "#151821", nav_bg: "#1d211f", nav_border: "#3a4540", shadow: "rgba(0,0,0,0.25)" };
+const CLEAN_LIGHT: PagePalette = PagePalette { fg: "#20242a", bg: "#ffffff", muted: "#5f6b7a", link: "#0b57d0", border: "#d9dee7", code_bg: "#eef2f7", nav_bg: "#edf1f7", nav_border: "#b7c0cf", shadow: "rgba(31,41,55,0.08)" };
+const CLEAN_DARK: PagePalette = PagePalette { fg: "#c9d1d9", bg: "#0d1117", muted: "#8b949e", link: "#58a6ff", border: "#30363d", code_bg: "#161b22", nav_bg: "#1f242c", nav_border: "#484f58", shadow: "rgba(0,0,0,0.32)" };
+const SOLARIZED_LIGHT: PagePalette = PagePalette { fg: "#657b83", bg: "#fdf6e3", muted: "#839496", link: "#268bd2", border: "#d8cfb8", code_bg: "#eee8d5", nav_bg: "#e8dfc8", nav_border: "#b8ac92", shadow: "rgba(88,110,117,0.10)" };
+const SOLARIZED_DARK: PagePalette = PagePalette { fg: "#93a1a1", bg: "#002b36", muted: "#839496", link: "#2aa198", border: "#174652", code_bg: "#073642", nav_bg: "#0b4250", nav_border: "#2a6673", shadow: "rgba(0,0,0,0.28)" };
+const GITHUB_LIGHT: PagePalette = PagePalette { fg: "#24292f", bg: "#ffffff", muted: "#57606a", link: "#0969da", border: "#d0d7de", code_bg: "#f6f8fa", nav_bg: "#eaeef2", nav_border: "#afb8c1", shadow: "rgba(31,35,40,0.08)" };
+const GITHUB_DARK: PagePalette = PagePalette { fg: "#c9d1d9", bg: "#0d1117", muted: "#8b949e", link: "#58a6ff", border: "#30363d", code_bg: "#161b22", nav_bg: "#21262d", nav_border: "#484f58", shadow: "rgba(0,0,0,0.32)" };
+const GRUVBOX_LIGHT: PagePalette = PagePalette { fg: "#3c3836", bg: "#fbf1c7", muted: "#7c6f64", link: "#076678", border: "#d5c4a1", code_bg: "#ebdbb2", nav_bg: "#f2e5bc", nav_border: "#bdae93", shadow: "rgba(60,56,54,0.14)" };
+const GRUVBOX_DARK: PagePalette = PagePalette { fg: "#ebdbb2", bg: "#282828", muted: "#bdae93", link: "#83a598", border: "#504945", code_bg: "#1d2021", nav_bg: "#3c3836", nav_border: "#665c54", shadow: "rgba(0,0,0,0.30)" };
+const CATPPUCCIN_LIGHT: PagePalette = PagePalette { fg: "#4c4f69", bg: "#eff1f5", muted: "#6c6f85", link: "#1e66f5", border: "#bcc0cc", code_bg: "#e6e9ef", nav_bg: "#dce0e8", nav_border: "#9ca0b0", shadow: "rgba(76,79,105,0.14)" };
+const CATPPUCCIN_DARK: PagePalette = PagePalette { fg: "#cdd6f4", bg: "#1e1e2e", muted: "#a6adc8", link: "#89b4fa", border: "#45475a", code_bg: "#181825", nav_bg: "#313244", nav_border: "#585b70", shadow: "rgba(0,0,0,0.34)" };
+const SEPIA_LIGHT: PagePalette = PagePalette { fg: "#514131", bg: "#f6efdf", muted: "#7f6a55", link: "#a45518", border: "#d8c6aa", code_bg: "#eee2cf", nav_bg: "#ecdfca", nav_border: "#bfa787", shadow: "rgba(87,64,41,0.16)" };
+const PAPER_LIGHT: PagePalette = PagePalette { fg: "#24211d", bg: "#fbfaf7", muted: "#686159", link: "#2f6f73", border: "#ded8cc", code_bg: "#f1eee7", nav_bg: "#ebe6dc", nav_border: "#bfb6a6", shadow: "rgba(37,32,26,0.13)" };
+const NORD_DARK: PagePalette = PagePalette { fg: "#d8dee9", bg: "#2e3440", muted: "#a9b3c1", link: "#88c0d0", border: "#4c566a", code_bg: "#242933", nav_bg: "#3b4252", nav_border: "#66738a", shadow: "rgba(0,0,0,0.28)" };
+const DRACULA_DARK: PagePalette = PagePalette { fg: "#f8f8f2", bg: "#282a36", muted: "#b6b6c8", link: "#8be9fd", border: "#4a4d62", code_bg: "#1f212b", nav_bg: "#3a3d4d", nav_border: "#62677f", shadow: "rgba(0,0,0,0.34)" };
+const CONTRAST_DARK: PagePalette = PagePalette { fg: "#ffffff", bg: "#000000", muted: "#d7d7d7", link: "#7dd3fc", border: "#9a9a9a", code_bg: "#080808", nav_bg: "#1f1f1f", nav_border: "#ffffff", shadow: "rgba(0,0,0,0.50)" };
+const SLATE_DARK: PagePalette = PagePalette { fg: "#d7dde7", bg: "#111827", muted: "#9aa6b6", link: "#38bdf8", border: "#334155", code_bg: "#0f172a", nav_bg: "#1e293b", nav_border: "#475569", shadow: "rgba(0,0,0,0.34)" };
+
+fn page_theme_palettes(theme: PageTheme) -> (PagePalette, PagePalette) {
+    match theme {
+        PageTheme::Auto => (HAYSTACK_LIGHT, HAYSTACK_DARK),
+        PageTheme::Minimal | PageTheme::Light | PageTheme::Dark => (CLEAN_LIGHT, CLEAN_DARK),
+        PageTheme::Solarized | PageTheme::SolarizedLight | PageTheme::SolarizedDark => (SOLARIZED_LIGHT, SOLARIZED_DARK),
+        PageTheme::Github | PageTheme::GithubLight | PageTheme::GithubDark => (GITHUB_LIGHT, GITHUB_DARK),
+        PageTheme::Gruvbox | PageTheme::GruvboxLight | PageTheme::GruvboxDark => (GRUVBOX_LIGHT, GRUVBOX_DARK),
+        PageTheme::Catppuccin | PageTheme::CatppuccinLatte | PageTheme::CatppuccinMocha => (CATPPUCCIN_LIGHT, CATPPUCCIN_DARK),
+        PageTheme::Sepia => (SEPIA_LIGHT, CLEAN_DARK),
+        PageTheme::Paper => (PAPER_LIGHT, CLEAN_DARK),
+        PageTheme::Nord => (CLEAN_LIGHT, NORD_DARK),
+        PageTheme::Dracula => (CLEAN_LIGHT, DRACULA_DARK),
+        PageTheme::HighContrast => (CLEAN_LIGHT, CONTRAST_DARK),
+        PageTheme::Slate => (CLEAN_LIGHT, SLATE_DARK),
+    }
+}
+
+fn palette_declarations(palette: PagePalette, scheme: &str) -> String {
+    format!(
+        "color-scheme: {scheme}; --fg: {}; --bg: {}; --muted: {}; --link: {}; --border: {}; --code-bg: {}; --nav-active-bg: {}; --nav-active-border: {}; --shadow: {};",
+        palette.fg, palette.bg, palette.muted, palette.link, palette.border, palette.code_bg,
+        palette.nav_bg, palette.nav_border, palette.shadow,
+    )
+}
+
+fn page_theme_css(theme: PageTheme) -> String {
+    let (light, dark) = page_theme_palettes(theme);
+    let light = palette_declarations(light, "light");
+    let dark = palette_declarations(dark, "dark");
+    format!(
+        ":root, html[data-theme='light'] {{ {light} }}\nhtml[data-theme='dark'] {{ {dark} }}\n@media (prefers-color-scheme: dark) {{ html[data-theme='auto'] {{ {dark} }} }}"
+    )
+}
+
 fn default_css() -> &'static str {
-    r#":root {
-  --fg: #222222;
-  --bg: #f7f4e9; /* retro paper */
-  --muted: #6b665e;
-  --link: #2f6f6f; /* teal-ish retro */
-  --border: #d9d4c7;
-  --code-bg: #efe9d6;
-  --nav-active-bg: #ece4cc;
-  --nav-active-border: #cfc5aa;
-  --shadow: rgba(0,0,0,0.04);
-}
-[data-theme='dark'] {
-  --fg: #e6e1cf;
-  --bg: #0e0f13;
-  --muted: #9a968a;
-  --link: #7fd1b9;
-  --border: #2a2c33;
-  --code-bg: #151821;
-  --nav-active-bg: #1d211f;
-  --nav-active-border: #3a4540;
-  --shadow: rgba(0,0,0,0.25);
-}
-@media (prefers-color-scheme: dark) {
-  [data-theme='auto'] {
-    --fg: #e6e1cf;
-    --bg: #0e0f13;
-    --muted: #9a968a;
-    --link: #7fd1b9;
-    --border: #2a2c33;
-    --code-bg: #151821;
-    --nav-active-bg: #1d211f;
-    --nav-active-border: #3a4540;
-    --shadow: rgba(0,0,0,0.25);
-  }
-}
-html, body { padding: 0; margin: 0; background: var(--bg); color: var(--fg); }
+    r#"html, body { padding: 0; margin: 0; background: var(--bg); color: var(--fg); }
 body {
   font-family: "Source Serif Pro Variable", "Source Serif 4", "Times New Roman", Times, serif;
   font-size: 18px;
@@ -2662,7 +2902,7 @@ body {
 }
 .sidebar-nav a:hover {
   color: var(--link);
-  background: color-mix(in srgb, var(--code-bg) 70%, transparent);
+  background: var(--code-bg);
 }
 .sidebar-nav a.active,
 .sidebar-nav a[aria-current='page'] {
@@ -2714,7 +2954,7 @@ h4 { font-size: 1.1rem; }
 p { margin: 1em 0; text-align: justify; }
 a { color: var(--link); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; text-decoration-skip-ink: auto; }
 a:hover { opacity: 0.9; }
-::selection { background: color-mix(in srgb, var(--link) 25%, transparent); }
+::selection { background: var(--border); }
 img, video { max-width: 100%; height: auto; border-radius: 2px; box-shadow: 0 1px 0 var(--shadow); }
 hr { border: 0; border-top: 1px dashed var(--border); margin: 2.2rem 0; }
 ul, ol { padding-left: 1.2rem; }
@@ -2738,7 +2978,7 @@ li.hidden { display: none; }
 .lang-index-nav a.active { border-color: var(--fg); }
 blockquote {
   margin: 1.2rem 0; padding: 0.75rem 1rem; border-left: 3px solid var(--border);
-  color: var(--muted); background: color-mix(in srgb, var(--code-bg) 65%, transparent);
+  color: var(--muted); background: var(--code-bg);
   font-style: italic;
 }
 code, pre {
@@ -2785,7 +3025,7 @@ pre {
 .codex-command pre, .codex-stderr pre { margin-bottom: 0; }
 .codex-error {
   margin: 0.75rem 0; padding: 0.6rem 0.8rem; border-left: 3px solid #b94a48;
-  background: color-mix(in srgb, #b94a48 12%, var(--code-bg));
+  background: rgba(185, 74, 72, 0.12);
 }
 .codex-usage { margin-top: 1rem; font-size: 0.8rem; }
 .codex-stderr { margin-top: 1rem; }
@@ -2800,7 +3040,7 @@ pre {
   padding: 0.9rem;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: color-mix(in srgb, var(--code-bg) 60%, transparent);
+  background: var(--code-bg);
   overflow-x: auto;
 }
 .graphviz-dot[data-graphviz-pending='1'] {
@@ -2818,9 +3058,38 @@ pre {
 }
 .graphviz-error {
   border-style: dashed;
-  background: color-mix(in srgb, #b94a48 12%, var(--code-bg));
+  background: rgba(185, 74, 72, 0.12);
 }
 .graphviz-error pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
+.mermaid-diagram {
+  margin: 1rem 0;
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--code-bg);
+  overflow-x: auto;
+}
+.mermaid-diagram[data-mermaid-pending='1'] {
+  color: var(--muted);
+  font: 0.9rem ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.mermaid-rendered { min-width: min-content; }
+.mermaid-rendered:empty { display: none; }
+.mermaid-rendered svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+.mermaid-error {
+  border-style: dashed;
+  background: rgba(185, 74, 72, 0.12);
+}
+.mermaid-error .mermaid-rendered {
+  display: block;
   margin: 0;
   white-space: pre-wrap;
 }
@@ -2828,8 +3097,8 @@ pre {
  pre code { padding: 0; background: transparent; }
  table { width: 100%; border-collapse: collapse; margin: 1.2rem 0; }
  th, td { padding: 0.5rem 0.6rem; border: 1px solid var(--border); text-align: left; }
- thead th { background: color-mix(in srgb, var(--code-bg) 85%, transparent); }
- details { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.9rem; background: color-mix(in srgb, var(--code-bg) 75%, transparent); }
+ thead th { background: var(--code-bg); }
+ details { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.9rem; background: var(--code-bg); }
  summary { cursor: pointer; font-weight: 600; }
  kbd { font-family: inherit; background: var(--code-bg); border: 1px solid var(--border); border-bottom-width: 2px; padding: 0 0.35rem; border-radius: 4px; }
 
@@ -2984,9 +3253,14 @@ fn normalize_name(s: &str) -> String {
 }
 
 fn list_themes() {
+    println!("Built-in page themes ({}):", PageTheme::value_variants().len());
+    for theme in PageTheme::value_variants() {
+        println!("- {}", theme.name());
+    }
+    println!();
     let mut names: Vec<&str> = THEME_SET.themes.keys().map(|s| s.as_str()).collect();
     names.sort_unstable_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
-    println!("Available themes ({}):", names.len());
+    println!("Syntax highlighting themes ({}):", names.len());
     for n in names {
         println!("- {}", n);
     }
@@ -3043,6 +3317,53 @@ fn highlight_code_blocks_in_html(input_html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_built_in_page_theme() {
+        let cli = Cli::try_parse_from(["haystack", "build", "--theme", "solarized-dark"]).unwrap();
+
+        match cli.command {
+            Commands::Build { theme, .. } => assert_eq!(theme, PageTheme::SolarizedDark),
+            _ => panic!("expected build command"),
+        }
+    }
+
+    #[test]
+    fn renders_selected_page_theme_with_matching_initial_mode() {
+        let theme = ThemeConfig {
+            page: PageTheme::CatppuccinMocha,
+            ..ThemeConfig::default()
+        };
+        let mut assets = AssetConfig::default();
+        let rendered = convert_markdown_to_html_with_ctx("# Theme", &theme, None, &mut assets).unwrap();
+
+        assert!(rendered.contains(r#"data-theme="dark" data-page-theme="catppuccin-mocha""#));
+        assert!(rendered.contains("--bg: #1e1e2e"));
+        assert!(rendered.contains("--bg: #eff1f5"));
+        assert!(rendered.contains("localStorage.getItem('haystack-theme') || 'dark'"));
+    }
+
+    #[test]
+    fn every_page_theme_defines_light_and_dark_palettes() {
+        for theme in PageTheme::value_variants() {
+            let css = page_theme_css(*theme);
+            assert!(css.contains("html[data-theme='light']"), "missing light palette for {}", theme.name());
+            assert!(css.contains("html[data-theme='dark']"), "missing dark palette for {}", theme.name());
+            assert!(css.contains("html[data-theme='auto']"), "missing auto palette for {}", theme.name());
+        }
+    }
+
+    #[test]
+    fn built_in_css_avoids_colors_unsupported_by_html2canvas() {
+        let mut css = default_css().to_string();
+        for theme in PageTheme::value_variants() {
+            css.push_str(&page_theme_css(*theme));
+        }
+
+        assert!(!css.contains("color-mix("));
+        assert!(!css.contains("oklch("));
+        assert!(!css.contains("lab("));
+    }
 
     fn test_assets(prefix: &str, entries: &[(&str, &str, &str)]) -> AssetConfig {
         let mut manifest = BTreeMap::new();
@@ -3222,6 +3543,36 @@ mod tests {
     }
 
     #[test]
+    fn renders_mermaid_code_blocks_as_diagram_containers() {
+        let theme = ThemeConfig::default();
+        let mut assets = AssetConfig::default();
+        let rendered = convert_markdown_to_html_with_ctx(
+            "```mermaid\nflowchart LR\n  A --> B\n```",
+            &theme,
+            None,
+            &mut assets,
+        ).unwrap();
+
+        assert!(rendered.contains(r#"class="mermaid-diagram""#));
+        assert!(rendered.contains(r#"class="mermaid-source""#));
+        assert!(rendered.contains("A --&gt; B"));
+        assert!(rendered.contains("mermaid@12"));
+        assert!(rendered.contains("securityLevel: 'strict'"));
+        assert!(rendered.contains("haystackRenderMermaid(output)"));
+        assert!(rendered.contains("renderAll(document, true)"));
+        assert!(!rendered.contains(r#"language-mermaid"#));
+    }
+
+    #[test]
+    fn renders_mermaid_code_blocks_in_markdown_fragments() {
+        let fragment = render_markdown_fragment("```mermaid\nsequenceDiagram\n  A->>B: Hello\n```");
+
+        assert!(fragment.contains(r#"class="mermaid-diagram""#));
+        assert!(fragment.contains("A-&gt;&gt;B: Hello"));
+        assert!(!fragment.contains(r#"language-mermaid"#));
+    }
+
+    #[test]
     fn renders_codex_jsonl_events() {
         let jsonl = concat!(
             "{\"type\":\"thread.started\",\"thread_id\":\"thread_1\"}\n",
@@ -3291,6 +3642,59 @@ mod tests {
         assert!(assets.generated.contains_key("lessons/audio/n2-aging-society.mp3"));
         assert!(assets.generated.contains_key("lessons/n2/images/chart.png"));
         assert!(assets.generated.contains_key("lessons/audio/transcript.pdf"));
+    }
+
+    #[test]
+    fn build_and_serve_indexes_skip_node_modules() {
+        let root = std::env::temp_dir().join(format!(
+            "haystack-node-modules-test-{}-{}",
+            std::process::id(),
+            generate_block_id(),
+        ));
+        let src = root.join("src");
+        let out = root.join("output");
+        for dir in ["node_modules/pkg", "guide/node_modules/pkg", "ja/node_modules/pkg"] {
+            let dir = src.join(dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("dependency.md"), "# Dependency\n").unwrap();
+            fs::write(dir.join("dependency.org"), "* Dependency\n").unwrap();
+            fs::write(dir.join("dependency.html"), "<h1>Dependency</h1>").unwrap();
+            fs::write(dir.join("package.js"), "dependency").unwrap();
+        }
+        fs::write(src.join("guide/page.md"), "# Guide\n").unwrap();
+        fs::write(src.join("guide/style.css"), "body {}").unwrap();
+        fs::write(src.join("ja/page.md"), "# Guide\n").unwrap();
+        // Similar directory names and files named node_modules remain valid assets.
+        fs::create_dir_all(src.join("node_modules-examples")).unwrap();
+        fs::write(src.join("node_modules-examples/page.md"), "# Example\n").unwrap();
+        fs::write(src.join("guide/node_modules-examples.txt"), "example").unwrap();
+        fs::create_dir_all(src.join("assets")).unwrap();
+        fs::write(src.join("assets/node_modules"), "asset").unwrap();
+        let manifest = root.join("static-files.txt");
+        let mut assets = AssetConfig::new(None, &src, &manifest).unwrap();
+        let mut lang = LangConfig::default();
+        lang.others = vec!["ja".to_string()];
+
+        build_all(&src, &out, &ThemeConfig::default(), &lang, true, &mut assets, &manifest).unwrap();
+
+        for dir in ["node_modules", "guide/node_modules", "ja/node_modules"] {
+            assert!(!out.join(dir).exists(), "unexpected output: {dir}");
+        }
+        assert!(out.join("guide/page.html").exists());
+        assert!(out.join("ja/page.html").exists());
+        assert!(out.join("node_modules-examples/page.html").exists());
+        assert_eq!(fs::read_to_string(out.join("guide/style.css")).unwrap(), "body {}");
+        assert!(out.join("guide/node_modules-examples.txt").exists());
+        assert_eq!(fs::read_to_string(out.join("assets/node_modules")).unwrap(), "asset");
+        for index in ["index.html", "ja/index.html"] {
+            assert!(!fs::read_to_string(out.join(index)).unwrap().contains("dependency"));
+        }
+        assert_eq!(collect_docs_under(&src, None, &lang.others), vec![
+            PathBuf::from("guide/page.md"),
+            PathBuf::from("node_modules-examples/page.md"),
+        ]);
+        assert_eq!(collect_docs_under(&src.join("ja"), None, &Vec::new()), vec![PathBuf::from("page.md")]);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
