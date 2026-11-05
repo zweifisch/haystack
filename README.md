@@ -65,6 +65,8 @@ paths starting with `/` resolve from `src/`. For example, `"../models/scene.glb"
 in `src/js/viewer.js` becomes `"https://assets.example.com/models/scene.HASH.glb"`.
 Query strings and fragments are preserved. External URLs, comments, escaped
 strings, and template strings containing `${...}` are left unchanged.
+JavaScript strings are only treated as asset paths when a local file or manifest
+entry exists; other filename-like strings are left unchanged without warnings.
 
 Referenced assets available locally, including `.glb` models, are also copied to
 their hashed keys in `output/`, matching the rewritten URLs. Referenced
@@ -80,7 +82,7 @@ haystack build --asset-prefix https://assets.example.com --static-file-list stat
 ```
 
 If a referenced asset is missing locally and has no manifest entry, Haystack
-prints a warning and leaves that URL unchanged.
+prints one warning per missing asset and leaves that URL unchanged.
 
 ### Serve on-demand HTML from `src/`:
 

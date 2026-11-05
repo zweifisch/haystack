@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -224,6 +224,7 @@ struct AssetConfig {
     manifest: BTreeMap<String, StaticAsset>,
     generated: BTreeMap<String, StaticAsset>,
     rewritten_scripts: BTreeMap<String, String>,
+    warned_missing: BTreeSet<String>,
 }
 
 impl AssetConfig {
@@ -238,6 +239,7 @@ impl AssetConfig {
             manifest,
             generated: BTreeMap::new(),
             rewritten_scripts: BTreeMap::new(),
+            warned_missing: BTreeSet::new(),
         })
     }
 }
@@ -1698,7 +1700,18 @@ fn rewrite_javascript_asset_urls(script: &str, assets: &mut AssetConfig, page_di
         let replacement = if matches!(quote, "\"" | "'" | "`") {
             let value = &literal[1..literal.len() - 1];
             if !value.contains('\\') && !value.contains("${") && is_javascript_asset_url(value) {
-                prefix_asset_url(value, &prefix, page_dir, assets)?
+                // Extension-like strings can be metadata or fragments of paths
+                // assembled at runtime. Only resolve known, complete asset paths.
+                let known_asset = asset_site_path(value, page_dir).is_some_and(|path| {
+                    assets.generated.contains_key(&path)
+                        || assets.manifest.contains_key(&path)
+                        || assets.source_dir.join(&path).is_file()
+                });
+                if known_asset {
+                    prefix_asset_url(value, &prefix, page_dir, assets)?
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1775,20 +1788,22 @@ fn rewrite_asset_url_value(attr: &str, value: &str, prefix: &str, page_dir: &str
     prefix_asset_url(value, prefix, page_dir, assets)
 }
 
-fn prefix_asset_url(value: &str, prefix: &str, page_dir: &str, assets: &mut AssetConfig) -> Result<Option<String>> {
+fn asset_site_path(value: &str, page_dir: &str) -> Option<String> {
     if is_external_or_special_url(value) || value == "/" {
-        return Ok(None);
+        return None;
     }
-    let (path_part, suffix) = split_url_path_suffix(value);
+    let (path_part, _) = split_url_path_suffix(value);
     let site_path = if let Some(path) = path_part.strip_prefix('/') {
         normalize_site_path("", path)
     } else {
         normalize_site_path(page_dir, path_part)
     };
-    let Some(site_path) = site_path else { return Ok(None); };
-    if site_path.is_empty() {
-        return Ok(None);
-    }
+    site_path.filter(|path| !path.is_empty())
+}
+
+fn prefix_asset_url(value: &str, prefix: &str, page_dir: &str, assets: &mut AssetConfig) -> Result<Option<String>> {
+    let Some(site_path) = asset_site_path(value, page_dir) else { return Ok(None); };
+    let (_, suffix) = split_url_path_suffix(value);
     let Some(asset) = resolve_static_asset(assets, &site_path)? else {
         return Ok(None);
     };
@@ -1855,11 +1870,13 @@ fn resolve_static_asset(assets: &mut AssetConfig, site_path: &str) -> Result<Opt
     } else if let Some(asset) = assets.manifest.get(site_path) {
         asset.clone()
     } else {
-        eprintln!(
-            "warning: asset {} is referenced but {} does not exist and no manifest entry was found; leaving URL unchanged",
-            site_path,
-            source_path.display(),
-        );
+        if assets.warned_missing.insert(site_path.to_string()) {
+            eprintln!(
+                "warning: asset {} is referenced but {} does not exist and no manifest entry was found; leaving URL unchanged",
+                site_path,
+                source_path.display(),
+            );
+        }
         return Ok(None);
     };
 
@@ -3495,6 +3512,7 @@ mod tests {
             manifest,
             generated: BTreeMap::new(),
             rewritten_scripts: BTreeMap::new(),
+            warned_missing: BTreeSet::new(),
         }
     }
 
@@ -3840,6 +3858,7 @@ const text = 'index.html';
             .replace("`/images/texture.PNG`", "`https://assets.example.com/images/texture.def.PNG`");
         assert_eq!(rewritten, expected);
         assert_eq!(assets.generated.len(), 2);
+        assert!(assets.warned_missing.is_empty(), "unresolved JavaScript strings are not confirmed asset references");
         assert_eq!(rewrite_javascript_asset_urls(script, &mut AssetConfig::default(), "js").unwrap(), script);
 
         let html = r#"<script>load('../models/scene.glb')</script><script type="module">load("/images/texture.PNG")</script><script type="application/json">{"model":"/models/scene.glb"}</script>"#;
@@ -4019,7 +4038,7 @@ const text = 'index.html';
         let src = root.join("src");
         let out = root.join("output");
         fs::create_dir_all(src.join("posts")).unwrap();
-        fs::write(src.join("posts").join("index.md"), "# Home\n\n<audio src=\"../audio/missing.mp3\"></audio>\n").unwrap();
+        fs::write(src.join("posts").join("index.md"), "# Home\n\n<audio src=\"../audio/missing.mp3\"></audio><audio src=\"../audio/missing.mp3?v=2\"></audio>\n").unwrap();
         let manifest = root.join("static-assets.txt");
         let mut assets = AssetConfig::new(
             Some("https://assets.example.com".to_string()),
@@ -4043,6 +4062,7 @@ const text = 'index.html';
 
         assert!(page.contains(r#"src="../audio/missing.mp3""#));
         assert_eq!(list, "");
+        assert_eq!(assets.warned_missing, BTreeSet::from(["audio/missing.mp3".to_string()]));
     }
 
     #[test]
