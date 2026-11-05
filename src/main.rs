@@ -223,6 +223,7 @@ struct AssetConfig {
     source_dir: PathBuf,
     manifest: BTreeMap<String, StaticAsset>,
     generated: BTreeMap<String, StaticAsset>,
+    rewritten_scripts: BTreeMap<String, String>,
 }
 
 impl AssetConfig {
@@ -236,6 +237,7 @@ impl AssetConfig {
             source_dir: source_dir.to_path_buf(),
             manifest,
             generated: BTreeMap::new(),
+            rewritten_scripts: BTreeMap::new(),
         })
     }
 }
@@ -338,7 +340,14 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
                         let rel = path.strip_prefix(&src_root).unwrap();
                         let out_path = out_root.join(rel);
                         if let Some(parent) = out_path.parent() { fs::create_dir_all(parent)?; }
-                        fs::copy(path, &out_path).with_context(|| format!("copying static {} -> {}", path.display(), out_path.display()))?;
+                        if assets.prefix.is_some() && is_javascript_path(&path.to_string_lossy()) {
+                            let script = fs::read_to_string(path).with_context(|| format!("reading JavaScript {}", path.display()))?;
+                            let page_dir = rel_root.join(rel.parent().unwrap_or_else(|| Path::new("")))
+                                .to_string_lossy().replace('\\', "/");
+                            fs::write(&out_path, rewrite_javascript_asset_urls(&script, assets, &page_dir)?)?;
+                        } else {
+                            fs::copy(path, &out_path).with_context(|| format!("copying static {} -> {}", path.display(), out_path.display()))?;
+                        }
                         println!("Copied {} -> {}", path.display(), out_path.display());
                     }
                 }
@@ -364,6 +373,21 @@ fn build_all(src_dir: &Path, out_dir: &Path, theme: &ThemeConfig, lang: &LangCon
         let rel_root = Path::new(lang_code);
         if src_dir.join(rel_root).exists() {
             process_lang(src_dir, out_dir, theme, rel_root, &format!("{}/", lang_code), generate_index, lang, assets)?;
+        }
+    }
+    // Materialize every available referenced asset at the key used in URLs.
+    // Manifest-only assets may already exist on the CDN without a local source.
+    for (site_path, asset) in &assets.generated {
+        let path = out_dir.join(&asset.key);
+        if let Some(script) = assets.rewritten_scripts.get(site_path) {
+            if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+            fs::write(&path, script).with_context(|| format!("writing JavaScript asset {}", path.display()))?;
+        } else {
+            let source = src_dir.join(site_path);
+            if source.is_file() {
+                if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+                fs::copy(&source, &path).with_context(|| format!("copying hashed asset {} -> {}", source.display(), path.display()))?;
+            }
         }
     }
     write_static_file_list(static_file_list, &assets.generated)?;
@@ -1639,6 +1663,85 @@ fn rewrite_asset_urls_maybe_collect(body_html: &str, assets: &mut AssetConfig, p
         last = matched.end();
     }
     rewritten.push_str(&with_srcset[last..]);
+    rewrite_inline_javascript(&rewritten, assets, page_dir)
+}
+
+fn is_javascript_path(path: &str) -> bool {
+    Path::new(path).extension().and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "js" | "mjs" | "cjs"))
+}
+
+fn is_javascript_asset_url(value: &str) -> bool {
+    let (path, _) = split_url_path_suffix(value);
+    let extension = Path::new(path).extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    matches!(extension.to_ascii_lowercase().as_str(),
+        "glb" | "gltf" | "bin" | "obj" | "mtl" | "stl" | "fbx" | "usdz"
+        | "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "svg" | "ico"
+        | "ktx" | "ktx2" | "hdr" | "exr"
+        | "mp3" | "wav" | "ogg" | "oga" | "m4a" | "mp4" | "m4v" | "webm" | "ogv" | "mov"
+        | "woff" | "woff2" | "ttf" | "otf" | "json" | "wasm" | "pdf" | "zip" | "gz")
+}
+
+fn rewrite_javascript_asset_urls(script: &str, assets: &mut AssetConfig, page_dir: &str) -> Result<String> {
+    let Some(prefix) = assets.prefix.clone() else { return Ok(script.to_string()); };
+    // Consume comments and complete quoted tokens so examples in comments and
+    // interpolated templates cannot be mistaken for static asset paths.
+    static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(
+        r#"(?s)//[^\r\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`"#,
+    ).unwrap());
+    let mut rewritten = String::new();
+    let mut last = 0;
+    for token in TOKEN_RE.find_iter(script) {
+        rewritten.push_str(&script[last..token.start()]);
+        let literal = token.as_str();
+        let quote = &literal[..1];
+        let replacement = if matches!(quote, "\"" | "'" | "`") {
+            let value = &literal[1..literal.len() - 1];
+            if !value.contains('\\') && !value.contains("${") && is_javascript_asset_url(value) {
+                prefix_asset_url(value, &prefix, page_dir, assets)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(url) = replacement {
+            // Escape for the original JavaScript delimiter.
+            let url = url.replace('\\', "\\\\").replace(quote, &format!("\\{quote}"))
+                .replace('\n', "\\n").replace('\r', "\\r").replace("${", "\\${");
+            rewritten.push_str(&format!("{quote}{url}{quote}"));
+        } else {
+            rewritten.push_str(literal);
+        }
+        last = token.end();
+    }
+    rewritten.push_str(&script[last..]);
+    Ok(rewritten)
+}
+
+fn rewrite_inline_javascript(html: &str, assets: &mut AssetConfig, page_dir: &str) -> Result<String> {
+    static SCRIPT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)(<script\b[^>]*>)(.*?)(</script\s*>)").unwrap());
+    static TYPE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\btype\s*=\s*["']?([^\s"'>]+)"#).unwrap());
+    let mut rewritten = String::new();
+    let mut last = 0;
+    for caps in SCRIPT_RE.captures_iter(html) {
+        let matched = caps.get(0).unwrap();
+        rewritten.push_str(&html[last..matched.start()]);
+        let script_type = TYPE_RE.captures(&caps[1])
+            .map(|caps| caps[1].to_ascii_lowercase());
+        let is_javascript = script_type.as_deref().is_none_or(|kind| {
+            matches!(kind, "module" | "text/javascript" | "application/javascript")
+        });
+        rewritten.push_str(&caps[1]);
+        if is_javascript {
+            rewritten.push_str(&rewrite_javascript_asset_urls(&caps[2], assets, page_dir)?);
+        } else {
+            rewritten.push_str(&caps[2]);
+        }
+        rewritten.push_str(&caps[3]);
+        last = matched.end();
+    }
+    rewritten.push_str(&html[last..]);
     Ok(rewritten)
 }
 
@@ -1724,14 +1827,25 @@ fn normalize_site_path(page_dir: &str, value: &str) -> Option<String> {
 }
 
 fn resolve_static_asset(assets: &mut AssetConfig, site_path: &str) -> Result<Option<StaticAsset>> {
+    if site_path.split('/').any(|part| part.starts_with('.')) {
+        return Ok(None);
+    }
     if let Some(asset) = assets.generated.get(site_path) {
         return Ok(Some(asset.clone()));
     }
 
     let source_path = assets.source_dir.join(site_path);
     let asset = if source_path.is_file() {
-        let bytes = fs::read(&source_path)
+        let mut bytes = fs::read(&source_path)
             .with_context(|| format!("reading asset {}", source_path.display()))?;
+        if assets.prefix.is_some() && is_javascript_path(site_path) {
+            let script = std::str::from_utf8(&bytes)
+                .with_context(|| format!("reading JavaScript {}", source_path.display()))?;
+            let page_dir = site_path.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
+            let rewritten = rewrite_javascript_asset_urls(script, assets, page_dir)?;
+            bytes = rewritten.as_bytes().to_vec();
+            assets.rewritten_scripts.insert(site_path.to_string(), rewritten);
+        }
         let hash = content_hash(&bytes);
         StaticAsset {
             source: site_path.to_string(),
@@ -2505,7 +2619,8 @@ fn escape_attr(s: &str) -> String {
 }
 
 fn include_source_entry(entry: &walkdir::DirEntry) -> bool {
-    !(entry.file_type().is_dir() && entry.file_name() == "node_modules")
+    !entry.file_name().to_string_lossy().starts_with('.')
+        && !(entry.file_type().is_dir() && entry.file_name() == "node_modules")
 }
 
 fn collect_docs_under(root: &Path, _ignore: Option<()>, exclude_first_level: &Vec<String>) -> Vec<std::path::PathBuf> {
@@ -3379,6 +3494,7 @@ mod tests {
             source_dir: PathBuf::from("src"),
             manifest,
             generated: BTreeMap::new(),
+            rewritten_scripts: BTreeMap::new(),
         }
     }
 
@@ -3653,7 +3769,7 @@ mod tests {
         ));
         let src = root.join("src");
         let out = root.join("output");
-        for dir in ["node_modules/pkg", "guide/node_modules/pkg", "ja/node_modules/pkg"] {
+        for dir in ["node_modules/pkg", "guide/node_modules/pkg", "ja/node_modules/pkg", ".hidden/pkg", "guide/.cache/pkg", "ja/.hidden/pkg"] {
             let dir = src.join(dir);
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join("dependency.md"), "# Dependency\n").unwrap();
@@ -3677,7 +3793,7 @@ mod tests {
 
         build_all(&src, &out, &ThemeConfig::default(), &lang, true, &mut assets, &manifest).unwrap();
 
-        for dir in ["node_modules", "guide/node_modules", "ja/node_modules"] {
+        for dir in ["node_modules", "guide/node_modules", "ja/node_modules", ".hidden", "guide/.cache", "ja/.hidden"] {
             assert!(!out.join(dir).exists(), "unexpected output: {dir}");
         }
         assert!(out.join("guide/page.html").exists());
@@ -3698,6 +3814,42 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_javascript_asset_literals() {
+        let mut assets = test_assets("https://assets.example.com", &[
+            ("models/scene.glb", "models/scene.abc.glb", "abc"),
+            ("images/texture.PNG", "images/texture.def.PNG", "def"),
+        ]);
+        let script = r#"
+load('../models/./scene.glb?version=1#mesh');
+const texture = `/images/texture.PNG`;
+// load('../models/scene.glb');
+/* load("/models/scene.glb"); */
+load(`../models/${name}.glb`);
+load('https://other.example.com/scene.glb');
+load('//other.example.com/scene.glb');
+load('/missing.glb');
+load('/.hidden/scene.glb');
+load('../.scene.glb');
+load('../../outside.glb');
+load('../models/scene\\.glb');
+const text = 'index.html';
+"#;
+        let rewritten = rewrite_javascript_asset_urls(script, &mut assets, "js").unwrap();
+        let expected = script
+            .replace("load('../models/./scene.glb?version=1#mesh')", "load('https://assets.example.com/models/scene.abc.glb?version=1#mesh')")
+            .replace("`/images/texture.PNG`", "`https://assets.example.com/images/texture.def.PNG`");
+        assert_eq!(rewritten, expected);
+        assert_eq!(assets.generated.len(), 2);
+        assert_eq!(rewrite_javascript_asset_urls(script, &mut AssetConfig::default(), "js").unwrap(), script);
+
+        let html = r#"<script>load('../models/scene.glb')</script><script type="module">load("/images/texture.PNG")</script><script type="application/json">{"model":"/models/scene.glb"}</script>"#;
+        let rewritten = rewrite_asset_urls(html, &mut assets, "posts").unwrap();
+        assert!(rewritten.contains("load('https://assets.example.com/models/scene.abc.glb')"));
+        assert!(rewritten.contains("load(\"https://assets.example.com/images/texture.def.PNG\")"));
+        assert!(rewritten.contains(r#"{"model":"/models/scene.glb"}"#));
+    }
+
+    #[test]
     fn build_writes_static_file_list() {
         let root = std::env::temp_dir().join(format!(
             "haystack-static-list-test-{}-{}",
@@ -3711,6 +3863,19 @@ mod tests {
         fs::write(src.join("posts").join("index.md"), "# Home\n\n<audio src=\"../audio/theme.mp3\"></audio>\n").unwrap();
         fs::write(src.join("audio").join("theme.mp3"), b"audio").unwrap();
         fs::write(src.join("robots.txt"), "User-agent: *\n").unwrap();
+        fs::create_dir_all(src.join("js")).unwrap();
+        fs::write(src.join("js/viewer.js"), "load('../scene.glb');").unwrap();
+        fs::write(src.join("posts/viewer.html"), "<script src=\"../js/viewer.js\"></script><script>load('../OTHER.GLB')</script>").unwrap();
+        // Unreferenced files must stay out of the upload manifest.
+        fs::write(src.join("unused.glb"), b"unused").unwrap();
+        fs::write(src.join("scene.glb"), b"glTF").unwrap();
+        fs::write(src.join("OTHER.GLB"), b"model").unwrap();
+        fs::create_dir_all(src.join(".cache")).unwrap();
+        fs::write(src.join(".cache/hidden.glb"), b"hidden").unwrap();
+        fs::write(src.join(".hidden.glb"), b"hidden").unwrap();
+        fs::write(src.join("audio/.hidden.glb"), b"hidden").unwrap();
+        fs::write(src.join(".hidden.md"), "# Hidden").unwrap();
+        fs::write(src.join("hidden.html"), "<model-viewer src=\"/.cache/hidden.glb\"></model-viewer><model-viewer src=\"/.hidden.glb\"></model-viewer><model-viewer src=\"/audio/.hidden.glb\"></model-viewer>").unwrap();
         let manifest = out.join("static-files.txt");
         let hash = content_hash(b"audio");
         let expected_key = format!("audio/theme.{hash}.mp3");
@@ -3732,10 +3897,34 @@ mod tests {
 
         let page = fs::read_to_string(out.join("posts").join("index.html")).unwrap();
         let list = fs::read_to_string(&manifest).unwrap();
-        let _ = fs::remove_dir_all(&root);
+        let script = format!("load('https://assets.example.com/scene.{}.glb');", content_hash(b"glTF"));
+        let script_hash = content_hash(script.as_bytes());
+        let script_key = format!("js/viewer.{script_hash}.js");
+        assert_eq!(fs::read_to_string(out.join("js/viewer.js")).unwrap(), script);
+        assert_eq!(fs::read_to_string(out.join(&script_key)).unwrap(), script);
+        let viewer = fs::read_to_string(out.join("posts/viewer.html")).unwrap();
+        assert!(viewer.contains(&format!("src=\"https://assets.example.com/{script_key}\"")));
+        assert!(viewer.contains(&format!("load('https://assets.example.com/OTHER.{}.GLB')", content_hash(b"model"))));
+        assert!(!out.join(".hidden.glb").exists());
+        assert!(!out.join("audio/.hidden.glb").exists());
+        assert!(!out.join(".hidden.html").exists());
 
         assert!(page.contains(&format!(r#"src="https://assets.example.com/{expected_key}""#)));
-        assert_eq!(list, format!("audio/theme.mp3\t{expected_key}\t{hash}\n"));
+        let mut expected = BTreeMap::new();
+        for (source, bytes) in [
+            ("audio/theme.mp3", b"audio".as_slice()),
+            ("scene.glb", b"glTF".as_slice()),
+            ("OTHER.GLB", b"model".as_slice()),
+            ("js/viewer.js", script.as_bytes()),
+        ] {
+            let hash = content_hash(bytes);
+            let key = hashed_asset_key(source, &hash);
+            assert_eq!(fs::read(out.join(&key)).unwrap(), bytes, "hashed output for {source}");
+            expected.insert(source, format!("{source}\t{key}\t{hash}\n"));
+        }
+        assert_eq!(list, expected.into_values().collect::<String>());
+        assert!(!out.join(hashed_asset_key("unused.glb", &content_hash(b"unused"))).exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

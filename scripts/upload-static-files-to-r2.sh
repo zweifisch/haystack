@@ -4,7 +4,7 @@ set -eu
 usage() {
   cat <<'EOF'
 Usage:
-  upload-static-files-to-r2.sh [--remote] [--skip-existing] BUCKET [MANIFEST] [SOURCE_DIR]
+  upload-static-files-to-r2.sh [--remote] [--skip-existing] BUCKET [MANIFEST] [SOURCE_DIR] [OUTPUT_DIR]
 
 Options:
   --remote         Upload to the real Cloudflare R2 bucket instead of local storage.
@@ -14,6 +14,7 @@ Arguments:
   BUCKET      Cloudflare R2 bucket name.
   MANIFEST    Newline-delimited static file list. Default: static-files.txt
   SOURCE_DIR  Directory containing source assets. Default: src
+  OUTPUT_DIR  Build output containing rewritten JavaScript. Default: output
 
 Example:
   scripts/upload-static-files-to-r2.sh --remote --skip-existing haystack-assets
@@ -27,6 +28,8 @@ Each manifest line contains:
 Content-Type is set from the source file extension (case-insensitive).
 Unknown extensions use application/octet-stream. Omit --skip-existing to
 update Content-Type on objects that have already been uploaded.
+JavaScript is uploaded from OUTPUT_DIR at its hashed key, so the uploaded
+contents match the rewritten paths and content hash produced by the build.
 EOF
 }
 
@@ -37,6 +40,7 @@ content_type_for() {
     css) printf '%s' 'text/css' ;;
     js|mjs|cjs) printf '%s' 'text/javascript' ;;
     json|map) printf '%s' 'application/json' ;;
+    glb) printf '%s' 'model/gltf-binary' ;;
     xml) printf '%s' 'application/xml' ;;
     txt|md|org) printf '%s' 'text/plain' ;;
     csv) printf '%s' 'text/csv' ;;
@@ -89,6 +93,7 @@ done
 bucket="${1:-}"
 manifest="${2:-static-files.txt}"
 source_dir="${3:-src}"
+output_dir="${4:-output}"
 
 if [ -z "$bucket" ]; then
   usage >&2
@@ -112,6 +117,7 @@ fi
 
 uploaded=0
 skipped=0
+hidden_skipped=0
 missing=0
 
 while IFS='	' read -r source key hash || [ -n "${source:-}" ]; do
@@ -120,6 +126,13 @@ while IFS='	' read -r source key hash || [ -n "${source:-}" ]; do
     /*|*..*)
       echo "skip unsafe manifest source: $source" >&2
       missing=$((missing + 1))
+      continue
+      ;;
+  esac
+  case "$source" in
+    .*|*/.*)
+      echo "skip hidden path: $source"
+      hidden_skipped=$((hidden_skipped + 1))
       continue
       ;;
   esac
@@ -137,6 +150,10 @@ while IFS='	' read -r source key hash || [ -n "${source:-}" ]; do
   fi
 
   file="$source_dir/$source"
+  content_type=$(content_type_for "$source")
+  if [ "$content_type" = 'text/javascript' ]; then
+    file="$output_dir/$key"
+  fi
   if [ ! -f "$file" ]; then
     echo "missing: $file" >&2
     missing=$((missing + 1))
@@ -150,13 +167,13 @@ while IFS='	' read -r source key hash || [ -n "${source:-}" ]; do
   fi
 
   echo "upload: $file -> r2://$bucket/$key"
-  content_type=$(content_type_for "$source")
   wrangler r2 object put "$bucket/$key" --file "$file" --content-type "$content_type" $remote_flag
   uploaded=$((uploaded + 1))
 done < "$manifest"
 
 echo "uploaded: $uploaded"
 echo "skipped existing: $skipped"
+echo "skipped hidden paths: $hidden_skipped"
 
 if [ "$missing" -ne 0 ]; then
   echo "missing/skipped: $missing" >&2

@@ -33,10 +33,11 @@ haystack build [--theme THEME] [--theme-light NAME] [--theme-dark NAME] [--index
 ```
 
 - Scans `src/` for `*.md` and `*.org` (recursively).
-- Skips `node_modules/` directories at every depth, including their documents and static files. Serve's generated indexes also exclude these directories.
+- Skips `node_modules/` directories and files or directories starting with `.` at every depth, including their documents and static files. Serve's generated indexes also exclude these paths. The R2 uploader skips dot-prefixed files and directories even in an existing manifest.
 - Writes corresponding `*.html` into `output/`, preserving subdirectories.
 - Writes `static-files.txt` with tab-separated `source`, hashed object `key`,
-  and content `hash` columns for prefixed asset references.
+  and content `hash` columns for referenced assets when `--asset-prefix`
+  is enabled. Unreferenced static files are copied locally but omitted from the manifest.
 - With `--index`, also writes `output/index.html` with links to all Markdown/Org files.
  - Multi-language (optional):
    - Provide `--langs en,zh,fr` (first is default, unprefixed).
@@ -54,6 +55,22 @@ scripts/upload-static-files-to-r2.sh --remote --skip-existing my-bucket
 
 Because asset keys include a content hash, `--skip-existing` avoids uploading
 files that are already present in R2 under the same hashed key.
+
+With `--asset-prefix`, literal asset paths in `.js`, `.mjs`, `.cjs` files and
+inline JavaScript `<script>` blocks are also rewritten and added to the manifest.
+Known extensions include `.glb`, `.gltf`, `.bin`, common image/audio/video/font
+formats, `.json`, `.wasm`, `.pdf`, and archives (case-insensitive). Relative paths
+resolve from the script's directory (the page directory for inline scripts);
+paths starting with `/` resolve from `src/`. For example, `"../models/scene.glb"`
+in `src/js/viewer.js` becomes `"https://assets.example.com/models/scene.HASH.glb"`.
+Query strings and fragments are preserved. External URLs, comments, escaped
+strings, and template strings containing `${...}` are left unchanged.
+
+Referenced assets available locally, including `.glb` models, are also copied to
+their hashed keys in `output/`, matching the rewritten URLs. Referenced
+JavaScript files are hashed after rewriting. The uploader uses those built files for JavaScript,
+so run the build before uploading. For a custom output directory, pass it as
+the fourth positional argument after bucket, manifest, and source directory.
 
 For CI builds where ignored assets are unavailable, commit a generated manifest
 and pass it back as the static file list:
